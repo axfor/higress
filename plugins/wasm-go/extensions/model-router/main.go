@@ -32,6 +32,7 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessStreamingRequestBodyWithAction(onHttpStreamingRequestBody),
 		wrapper.WithRebuildMaxMemBytes[ModelRouterConfig](200*1024*1024),
 	)
 }
@@ -145,6 +146,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelRouterConfig) typ
 	proxywasm.RemoveHttpRequestHeader("content-length")
 	// 100MB buffer limit
 	ctx.SetRequestBodyBufferLimit(DefaultMaxBodyBytes)
+
+	// JSON 且 modelKey 是顶层普通 key：流式路径（见 stream.go）；其余走官方全量路径
+	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
+	if !streamable(config, contentType) {
+		ctx.BufferRequestBody()
+	}
 
 	return types.HeaderStopIteration
 }

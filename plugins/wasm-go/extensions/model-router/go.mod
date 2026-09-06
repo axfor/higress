@@ -5,6 +5,7 @@ go 1.24.1
 toolchain go1.24.7
 
 require (
+	github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform v0.0.0
 	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2
 	github.com/higress-group/wasm-go v1.0.7-0.20251209122854-7e766df5675c
 	github.com/stretchr/testify v1.9.0
@@ -22,3 +23,8 @@ require (
 	github.com/tidwall/resp v0.1.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/streamxform
+
+// TODO(PR): 依赖 wasm-go 新增的 ProcessStreamingRequestBodyWithAction 与 GC 看门狗，合入后改为版本号
+replace github.com/higress-group/wasm-go => /Users/axx/code/wasm-go
