@@ -28,4 +28,4 @@ require (
 replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/streamxform
 
 // TODO(PR): 依赖 wasm-go 新增的 ProcessStreamingRequestBodyWithAction 与 GC 看门狗，合入后改为版本号
-replace github.com/higress-group/wasm-go => /Users/axx/code/wasm-go
+replace github.com/higress-group/wasm-go => /Users/axx/wasm-go
