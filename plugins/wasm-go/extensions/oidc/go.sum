@@ -1,3 +1,5 @@
+github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432 h1:QTeANvysF+8qAYsYpPh9BwBr++GEA+HApZbxEVo95ZI=
+github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432/go.mod h1:uKVYICbRaxTlKqdm8E0dpjbysxM8uCPb9LV26hF3Km8=
 github.com/benbjohnson/clock v1.3.5 h1:VvXlSJBzZpA/zum6Sj74hxwYI2DIxRWuNIoXAzHZz5o=
 github.com/benbjohnson/clock v1.3.5/go.mod h1:J11/hYXuz8f4ySSvYwY0FKfm+ezbsZBKZxNJlLklBHA=
 github.com/bitly/go-simplejson v0.5.1 h1:xgwPbetQScXt1gh9BmoJ6j9JMr3TElvuIyjR8pgdoow=
@@ -18,6 +20,8 @@ github.com/higress-group/oauth2-proxy v1.0.1-0.20260605094027-396b01ca2ca4 h1:P7
 github.com/higress-group/oauth2-proxy v1.0.1-0.20260605094027-396b01ca2ca4/go.mod h1:sDlsoo4dx+Cx56vI5kegeXZAoQ4nnd7xWL7Oc4/4hLI=
 github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250822030947-8345453fddd0 h1:YGdj8KBzVjabU3STUfwMZghB+VlX6YLfJtLbrsWaOD0=
 github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250822030947-8345453fddd0/go.mod h1:tRI2LfMudSkKHhyv1uex3BWzcice2s/l8Ah8axporfA=
+github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2 h1:NY33OrWCJJ+DFiLc+lsBY4Ywor2Ik61ssk6qkGF8Ypo=
+github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2/go.mod h1:tRI2LfMudSkKHhyv1uex3BWzcice2s/l8Ah8axporfA=
 github.com/higress-group/wasm-go v1.0.2-0.20250911113549-cbf1cfcce774 h1:3nzDlUZ8+Nc0c2f8y0wUiw6mnyu1+ZYT0mK7x9Oitro=
 github.com/higress-group/wasm-go v1.0.2-0.20250911113549-cbf1cfcce774/go.mod h1:882/J8ccU4i+LeyFKmeicbHWAYLj8y7YZr60zk0OOCI=
 github.com/justinas/alice v1.2.0 h1:+MHSA/vccVCF4Uq37S42jwlkvI2Xzl7zTPCN5BnZNVo=

@@ -37,3 +37,5 @@ require (
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	golang.org/x/crypto v0.26.0 // indirect
 )
+
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432

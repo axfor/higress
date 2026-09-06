@@ -37,3 +37,5 @@ require (
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432
