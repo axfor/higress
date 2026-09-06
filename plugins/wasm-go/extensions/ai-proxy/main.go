@@ -13,8 +13,9 @@ import (
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/config"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
-	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/streamxform"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform/guard"
 
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
@@ -374,7 +375,7 @@ func onHttpStreamingRequestBody(ctx wrapper.HttpContext, pluginConfig config.Plu
 		st = newXformState(ctx, pluginConfig)
 		ctx.SetContext(ctxKeyXformState, st)
 	}
-	return st.feed(ctx, pluginConfig, chunk, isLastChunk)
+	return st.feed(chunk, isLastChunk)
 }
 
 const ctxKeyXformState = "aip_xform_state"
@@ -406,132 +407,87 @@ func streamXformCount(name string) {
 }
 
 type xformState struct {
-	tr       *streamxform.Transformer
-	plan     *provider.StreamPlan
-	apiName  provider.ApiName
-	total    int  // 已收到的字节数（回落时从宿主缓冲区取全量用）
-	fallback bool // 已切到官方全量路径
-	sent     bool // 已经放行过（请求头已下发）
+	st      *guard.State
+	plan    *provider.StreamPlan
+	apiName provider.ApiName
+	ctx     wrapper.HttpContext
+	cfg     config.PluginConfig
 }
 
 func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState {
-	st := &xformState{}
+	x := &xformState{ctx: ctx, cfg: cfg}
 	pc := cfg.GetProviderConfig()
-	if pc == nil {
-		st.fallback = true
-		return st
+	fallbackOnly := func() *xformState {
+		x.st = guard.New(&guard.Plan{Fallback: x.fallback, Metric: streamXformCount, Log: log.Warnf})
+		x.st.ForceFallback()
+		return x
 	}
-	st.apiName, _ = ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
-	plan, why := pc.NewStreamPlan(ctx, st.apiName, cfg.GetProvider())
+	if pc == nil {
+		return fallbackOnly()
+	}
+	x.apiName, _ = ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
+	plan, why := pc.NewStreamPlan(ctx, x.apiName, cfg.GetProvider())
 	if plan == nil {
 		log.Debugf("[stream-xform] 不走流式: %s", why)
 		streamXformCount("skipped")
-		st.fallback = true
-		return st
+		return fallbackOnly()
 	}
-	st.plan = plan
-	st.tr = plan.Tr
-	return st
+	x.plan = plan
+	x.st = guard.New(&guard.Plan{
+		Tr:          plan.Tr,
+		Mode:        guard.Transform,
+		Passthrough: plan.Passthrough,
+		OnCommit:    x.onCommit,
+		OnFinish:    x.onFinish,
+		Fallback:    x.fallback,
+		Uncoverable: func(why string) {
+			_ = util.ErrorHandler("ai-proxy.stream_xform_uncoverable", fmt.Errorf("streaming transform bailed after commit: %s", why))
+		},
+		Metric: streamXformCount,
+		Log:    log.Warnf,
+	})
+	return x
 }
 
-func (s *xformState) feed(ctx wrapper.HttpContext, cfg config.PluginConfig, chunk []byte, last bool) ([]byte, types.Action) {
-	s.total += len(chunk)
-	if s.fallback {
-		return s.feedFallback(ctx, cfg, last)
-	}
-	if s.plan.Passthrough {
-		// 官方对 body 一个字节都不动，逐块放行；首块前把上下文里的原始头信息写回（官方 defer 里做的事）
-		if !s.sent {
-			saveContextsToHeaders(ctx)
-			s.sent = true
-			streamXformCount("streamed")
-		}
-		return chunk, types.ActionContinue
-	}
-	s.tr.Write(chunk)
-	var fin []byte
-	if last {
-		fin = s.tr.Finish() // Finish 会把缓冲里剩余的全部输出一并取走，下面不能再指望 Out()
-	}
-	if bad, why := s.tr.Unsupported(); bad {
-		if s.tr.Committed() && s.sent {
-			// 已越过提交点：部分字节已发给上游，无法回落，只能失败。
-			log.Errorf("[stream-xform] 提交点之后判定不支持，请求失败: %s", why)
-			streamXformCount("uncoverable")
-			_ = util.ErrorHandler("ai-proxy.stream_xform_uncoverable",
-				fmt.Errorf("streaming transform bailed after commit: %s", why))
-			return nil, types.ActionPause
-		}
-		log.Warnf("[stream-xform] 回落到官方全量路径: %s (received=%d last=%v)", why, s.total, last)
-		streamXformCount("fallback")
-		s.fallback = true
-		return s.feedFallback(ctx, cfg, last)
-	}
-	if !s.tr.Committed() {
-		return nil, types.ActionPause // 提交点之前：留在宿主缓冲区，继续攒
-	}
-	if !s.sent {
-		pre := s.preludeOf()
-		if (s.plan.RequireModelBeforeCommit && !pre.ModelSeen) || (s.plan.RequireStreamBeforeCommit && !pre.StreamSeen && !last) {
-			// 请求路径依赖 model / stream，而它在提交点之前没出现：还没放行任何字节，可以干净回落。
-			// （整份 body 都到了还没见到 stream，就是 false，不必回落。）
-			log.Warnf("[stream-xform] 提交点前未见请求路径所需的字段，回落到官方全量路径 (received=%d last=%v)", s.total, last)
-			streamXformCount("fallback")
-			s.fallback = true
-			return s.feedFallback(ctx, cfg, last)
-		}
-		cfg.GetProviderConfig().StreamApplyPrelude(ctx, s.apiName, s.plan, pre, true)
-		if s.plan.AfterPrelude != nil {
-			s.plan.AfterPrelude(ctx)
-		}
-		saveContextsToHeaders(ctx)
-		s.sent = true
-		streamXformCount("streamed")
-	}
-	out := append(s.tr.Out(), fin...)
-	if last {
-		s.applyPrelude(ctx, cfg, false)
-		cfg.GetProviderConfig().StreamFinalizeContext(ctx, s.apiName, s.plan, s.preludeOf())
-		if s.plan.OnFinish != nil {
-			s.plan.OnFinish(ctx)
-		}
-	}
-	return out, types.ActionContinue
+func (x *xformState) feed(chunk []byte, last bool) ([]byte, types.Action) {
+	return x.st.Feed(chunk, last)
 }
 
-// feedFallback：官方全量路径。攒到末块，从宿主缓冲区取全量 body 交给官方转换。
-func (s *xformState) feedFallback(ctx wrapper.HttpContext, cfg config.PluginConfig, last bool) ([]byte, types.Action) {
-	if !last {
-		return nil, types.ActionPause
+// onCommit：首次放行请求头之前。请求路径依赖的字段（model / stream）在提交点前没出现就回落——
+// 这是"有界前瞻，超出窗口只能回落"的落点；整份 body 都到了还没见到 stream 就是 false，不必回落。
+func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
+	if x.plan.Passthrough {
+		// 官方对 body 一个字节都不动：首块前把上下文里的原始头信息写回（官方 defer 里做的事）
+		saveContextsToHeaders(x.ctx)
+		return true
 	}
-	body, err := proxywasm.GetHttpRequestBody(0, s.total)
-	if err != nil {
-		log.Errorf("[stream-xform] 回落路径读取 body 失败: %v", err)
-		return nil, types.ActionContinue
+	if (x.plan.RequireModelBeforeCommit && !pre.ModelSeen) || (x.plan.RequireStreamBeforeCommit && !pre.StreamSeen && !last) {
+		log.Warnf("[stream-xform] 提交点前未见请求路径所需的字段，回落到官方全量路径")
+		return false
 	}
-	// 官方 OnRequestBody 会自己 ReplaceHttpRequestBody；这里的返回值会再覆盖一次，
-	// 所以必须把它写回的内容读回来返回。
-	action := onHttpRequestBody(ctx, cfg, body)
-	if action == types.ActionPause {
-		return nil, types.ActionPause // 官方已发出本地应答（错误）或在等异步结果
+	x.cfg.GetProviderConfig().StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, true)
+	if x.plan.AfterPrelude != nil {
+		x.plan.AfterPrelude(x.ctx)
 	}
-	nb, err := proxywasm.GetHttpRequestBody(0, 1<<30) // 上限只是读取上限：官方转换后的 body 可能比输入大
-	if err != nil {
-		return body, types.ActionContinue
-	}
-	return nb, types.ActionContinue
+	saveContextsToHeaders(x.ctx)
+	return true
 }
 
-func (s *xformState) preludeOf() streamxform.Prelude {
-	if p, ok := s.tr.Protocol().(streamxform.Preluder); ok {
-		return p.Prelude()
+func (x *xformState) onFinish(pre streamxform.Prelude) {
+	if x.plan.Passthrough {
+		return
 	}
-	return streamxform.Prelude{}
+	pc := x.cfg.GetProviderConfig()
+	pc.StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, false)
+	pc.StreamFinalizeContext(x.ctx, x.apiName, x.plan, pre)
+	if x.plan.OnFinish != nil {
+		x.plan.OnFinish(x.ctx)
+	}
 }
 
-func (s *xformState) applyPrelude(ctx wrapper.HttpContext, cfg config.PluginConfig, headersMutable bool) {
-	pre := s.preludeOf()
-	cfg.GetProviderConfig().StreamApplyPrelude(ctx, s.apiName, s.plan, pre, headersMutable)
+// fallback：官方全量路径。
+func (x *xformState) fallback(body []byte) types.Action {
+	return onHttpRequestBody(x.ctx, x.cfg, body)
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, body []byte) types.Action {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/streamxform"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 )
 
 // officialGemini：gemini.go onChatCompletionRequestBody 的纯函数部分

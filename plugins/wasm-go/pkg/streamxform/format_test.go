@@ -27,3 +27,17 @@ func TestPassthroughPreservesFormatting(t *testing.T) {
 		}
 	}
 }
+
+// 值与逗号之间的空白也要保留（sjson 原地改写会保留它）。
+func TestTrailingWhitespaceBeforeComma(t *testing.T) {
+	in := "{\n  \"model\" : \"m\" ,\n  \"messages\" : [ 1 , { \"a\" : 1 , \"b\" : 2 } , 3 ] ,\n  \"stream\" : true\n}\n"
+	for _, cs := range []int{1, 3, 4096} {
+		out, ok, why := feedAll(NewOpenAI(OpenAIOptions{}), in, cs)
+		if !ok {
+			t.Fatalf("chunk=%d: %s", cs, why)
+		}
+		if out != in {
+			t.Fatalf("chunk=%d 透传不保真:\n got  %q\n want %q", cs, out, in)
+		}
+	}
+}

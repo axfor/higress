@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/streamxform"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 )
 

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/streamxform"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )

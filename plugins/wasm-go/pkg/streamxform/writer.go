@@ -15,7 +15,8 @@ type wframe struct {
 	raw    []byte // 非空时打开层用它代替 "key":（保留原始空白）/ 元素前空白
 	isArr  bool
 	opened bool
-	n      int // 已写子项数
+	n      int    // 已写子项数
+	trail  []byte // 上一个子项之后、逗号之前的原文空白：写下一个分隔符时先吐出来（保真）
 }
 
 // Level 当前层号（根 = 0）。
@@ -67,9 +68,18 @@ func (w *Writer) ensureOpen(level int) {
 func (w *Writer) sep(level int) {
 	f := &w.frames[level]
 	if f.n > 0 {
+		w.buf = append(w.buf, f.trail...)
 		w.buf = append(w.buf, ',')
 	}
+	f.trail = f.trail[:0]
 	f.n++
+}
+
+// trailWs 记下当前层上一个值与逗号之间的原文空白（派发帧读到逗号时调用）。
+func (w *Writer) trailWs(ws []byte) {
+	if l := len(w.frames) - 1; l >= 0 {
+		w.frames[l].trail = append(w.frames[l].trail[:0], ws...)
+	}
 }
 
 // CanWriteAt 报告能否直接写到第 level 层：其上所有层都还没打开。

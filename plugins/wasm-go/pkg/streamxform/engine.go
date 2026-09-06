@@ -105,6 +105,7 @@ type Transformer struct {
 	wsRaw       []byte
 	elemWs      []byte
 	rootCloseWs []byte
+	tailWs      []byte // 根对象之后的空白（如尾部换行）：Finish 时原样吐出
 
 	regOpen  bool
 	regT     regionTarget
@@ -193,6 +194,7 @@ func (t *Transformer) Finish() []byte {
 	}
 	t.w.ensureOpen(0)
 	t.w.pop(t.rootCloseWs)
+	t.w.buf = append(t.w.buf, t.tailWs...) // 根之后的空白（尾部换行）保真
 	t.committed = true
 	return t.Out()
 }
@@ -435,6 +437,8 @@ func (t *Transformer) scan(p []byte) {
 			if jsonSpace[c] {
 				if !t.regOpen && t.rootSeen && !t.rootDone {
 					t.wsRaw = append(t.wsRaw, c)
+				} else if t.rootDone {
+					t.tailWs = append(t.tailWs, c)
 				}
 				i++
 				continue
@@ -521,7 +525,8 @@ func (t *Transformer) scan(p []byte) {
 					t.Bail("意外的逗号")
 					continue
 				}
-				t.wsRaw = t.wsRaw[:0] // 值与逗号之间的空白不保留
+				t.w.trailWs(t.wsRaw) // 值与逗号之间的空白：挂到输出层，写下一个分隔符时原样吐出
+				t.wsRaw = t.wsRaw[:0]
 				if f.kind == fkObj {
 					f.ph = phKey
 				} else {
