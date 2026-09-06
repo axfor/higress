@@ -522,7 +522,7 @@ func (p *geminiProto) finishMessage(t *Transformer) {
 	if m.role == "system" {
 		if len(t.Deferred()) > 0 {
 			t.ReleaseNow()
-			if t.dead {
+			if t.Dead() {
 				return
 			}
 		}
@@ -533,7 +533,7 @@ func (p *geminiProto) finishMessage(t *Transformer) {
 	}
 	if len(t.Deferred()) > 0 {
 		t.ReleaseNow()
-		if t.dead {
+		if t.Dead() {
 			return
 		}
 	}

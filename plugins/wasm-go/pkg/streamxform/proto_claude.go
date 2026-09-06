@@ -723,7 +723,7 @@ func (p *claudeProto) finishMessage(t *Transformer) {
 	case "tool":
 		if len(t.Deferred()) > 0 {
 			t.ReleaseNow()
-			if t.dead {
+			if t.Dead() {
 				return
 			}
 		}
@@ -758,7 +758,7 @@ func (p *claudeProto) finishMessage(t *Transformer) {
 	// 普通消息（user / assistant 无 tool_calls / 其他 role）
 	if len(t.Deferred()) > 0 {
 		t.ReleaseNow()
-		if t.dead {
+		if t.Dead() {
 			return
 		}
 	}
@@ -914,7 +914,7 @@ func (p *claudeProto) Tail(t *Transformer) {
 	// tool_choice
 	if p.toolChoiceRaw != nil {
 		p.writeToolChoice(t, thinking)
-		if t.dead {
+		if t.Dead() {
 			return
 		}
 	}

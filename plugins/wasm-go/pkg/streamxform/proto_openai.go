@@ -87,7 +87,7 @@ func (p *openaiProto) enterMessages() bool {
 // sjson 对重复 key 只动第一个、其余原样保留，输出里后者仍在后面；
 // 而我们把第一个挪到末尾后，"后者覆盖前者"的顺序就反了——这种输入只能回落。
 func (p *openaiProto) moved(t *Transformer, key string, a Action) Action {
-	if a.kind == akCapture {
+	if a.IsCapture() {
 		p.movedTop = append(p.movedTop, key)
 	}
 	return a
@@ -251,7 +251,7 @@ func (p *openaiProto) Tail(t *Transformer) {
 	}
 	if p.opt.Variant != nil {
 		p.opt.Variant.Tail(t, &p.st)
-		if t.dead {
+		if t.Dead() {
 			return
 		}
 	}

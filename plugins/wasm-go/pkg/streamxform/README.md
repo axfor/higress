@@ -9,10 +9,10 @@ and `ai-statistics` (count user turns and pick up `model` without touching the b
 
 ## Layers
 
-| Layer | Files | Role |
+| Layer | Where | Role |
 |---|---|---|
-| Scanner + writer | `engine.go`, `writer.go`, `action.go`, `jsonutil.go` | Protocol-agnostic. Walks the JSON byte stream, dispatches every key / array element of an *entered* container to the protocol, and executes the returned action. The writer builds output lazily: a container that never receives a write leaves no trace. |
-| Protocols | `proto_claude.go`, `proto_gemini.go`, `proto_qwen.go`, `proto_openai.go`, `proto_openai_variants.go` | Hand-written, one per target format, derived line by line from the existing buffered transforms (`buildClaudeTextGenRequest`, `buildGeminiChatRequest`, `buildQwenTextGenerationRequest`, `defaultTransformRequestBody` …). No rule tables. |
+| Engine | [github.com/axfor/ason](https://github.com/axfor/ason) | Protocol-agnostic scanner, actions, lazy writer, strict JSON validation, sub-hook routing, `KeyProbe`. `ason.go` in this package re-exports its API under the local names, so protocol files do not see the module boundary. |
+| Protocols | `proto_claude.go`, `proto_gemini.go`, `proto_qwen.go`, `proto_openai.go`, `proto_openai_variants.go`, `hook_tools.go`, `proto_probe.go` (Prelude-aware `KeyProbe`) | Hand-written, one per target format, derived line by line from the existing buffered transforms (`buildClaudeTextGenRequest`, `buildGeminiChatRequest`, `buildQwenTextGenerationRequest`, `defaultTransformRequestBody` …). No rule tables. `Prelude` reports the body facts (model / stream) the integration layer needs. |
 | Guard | `guard/guard.go` | Drives a transformer from wasm-go's `ProcessStreamingRequestBodyWithAction` hook: holds the request headers (ActionPause) until a 64KB commit point, calls the plugin's `OnCommit` to apply header / context side effects, falls back to the plugin's buffered handler when a shape is unsupported before the commit point, fails the request (500) after it. Three shapes: `Transform` (whole body), `PrefixTransform` (rewrites at the start, rest forwarded without scanning), `Observe` (read-only, input forwarded as is). |
 
 ## Actions a protocol can return
@@ -49,8 +49,9 @@ hand-written cases × chunk sizes 1/7/4096 plus randomized fuzzing (`ai-proxy/pr
 `STREAMXFORM_FUZZ_N` scales the fuzz size). `ai-proxy/streaming_request_test.go`, `model-router/stream_test.go`
 and `ai-statistics/observer_*_test.go` drive the plugins through the wasm-go host emulator chunk by chunk
 (Pause / Continue / fallback / 500 / passthrough); `KeyProbe` rewrites are compared byte for byte with `sjson`.
-`bench_test.go` measures scanner throughput (long strings, base64, dense tool schemas); the string body is
-scanned eight bytes at a time, so validation costs nothing on the bytes that dominate large requests.
+`bench_test.go` measures end-to-end throughput of the Claude conversion and the passthrough (long strings,
+base64, dense tool schemas); engine-level tests (actions, replay, format fidelity, strict literals, chunk-size
+invariance, garbage input) live in the ason repository.
 
 Known deliberate differences from the buffered path: the buffered path type-checks the whole body against
 its structs and returns 500 on any mismatch, the streaming path applies the same type rules only to the

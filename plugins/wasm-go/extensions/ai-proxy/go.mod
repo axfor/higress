@@ -14,7 +14,10 @@ require (
 	github.com/tidwall/gjson v1.18.0
 )
 
-require github.com/tetratelabs/wazero v1.7.2 // indirect
+require (
+	github.com/axfor/ason v0.0.0 // indirect
+	github.com/tetratelabs/wazero v1.7.2 // indirect
+)
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -31,3 +34,5 @@ require (
 replace github.com/higress-group/wasm-go => /Users/axx/code/wasm-go
 
 replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/streamxform
+
+replace github.com/axfor/ason => /Users/axx/ason

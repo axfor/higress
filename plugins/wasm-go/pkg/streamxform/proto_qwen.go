@@ -474,7 +474,7 @@ func (p *qwenProto) OnLeave(t *Transformer) {
 		m.finalizing = true
 		if len(t.Deferred()) > 0 {
 			t.ReleaseNow()
-			if t.dead {
+			if t.Dead() {
 				return
 			}
 		}
