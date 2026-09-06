@@ -8,6 +8,14 @@ description: AI可观测配置参考
 
 提供 AI 可观测基础能力，包括 metric, log, trace，其后需接 ai-proxy 插件，如果不接 ai-proxy 插件的话，则需要用户进行相应配置才可生效。
 
+## 请求体流式观察
+
+轻量模式（`use_default_response_attributes: true`，或自定义属性里没有 `request_body` 来源）下，插件只需要请求体里的
+顶层 `model` 和 user 轮数，这两项在请求体逐块经过时就地统计，请求体一个字节都不缓冲、原样转发。
+需要从请求体提取属性的配置（默认属性集里的 `messages` / `question` / `system`，或自定义 `request_body` 属性）仍走全量缓冲。
+
+指标：`ai_statistics.stream.streamed` / `observe_bailed`（请求体不是合法 JSON 时停止观察、继续转发）。
+
 ## 运行属性
 
 插件执行阶段：`默认阶段`

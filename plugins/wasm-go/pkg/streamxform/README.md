@@ -1,8 +1,11 @@
 # streamxform — streaming request body transform
 
-Converts an OpenAI-style request body to the target provider's format **while the body is still arriving**,
-so ai-proxy no longer has to buffer the whole request before protocol conversion. Memory stays independent of
-request size; untouched bytes are forwarded verbatim.
+A shared module (`github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform`) for plugins that read or
+rewrite JSON request bodies **while the body is still arriving**, so they no longer buffer the whole
+request. Memory stays independent of request size; untouched bytes are forwarded verbatim.
+
+Used by `ai-proxy` (protocol conversion), `model-router` (find and rewrite `model` at the start of the body)
+and `ai-statistics` (count user turns and pick up `model` without touching the body).
 
 ## Layers
 
@@ -10,7 +13,7 @@ request size; untouched bytes are forwarded verbatim.
 |---|---|---|
 | Scanner + writer | `engine.go`, `writer.go`, `action.go`, `jsonutil.go` | Protocol-agnostic. Walks the JSON byte stream, dispatches every key / array element of an *entered* container to the protocol, and executes the returned action. The writer builds output lazily: a container that never receives a write leaves no trace. |
 | Protocols | `proto_claude.go`, `proto_gemini.go`, `proto_qwen.go`, `proto_openai.go`, `proto_openai_variants.go` | Hand-written, one per target format, derived line by line from the existing buffered transforms (`buildClaudeTextGenRequest`, `buildGeminiChatRequest`, `buildQwenTextGenerationRequest`, `defaultTransformRequestBody` …). No rule tables. |
-| Guard | `../main.go` (`xformState`), `../provider/streamhooks.go` (`NewStreamPlan`) | Holds the request headers (ActionPause) until a 64KB commit point, applies the header / context side effects the buffered path would have applied, falls back to the buffered path when a shape is unsupported before the commit point, fails the request (500, `ai-proxy.stream_xform_uncoverable`) after it. |
+| Guard | `guard/guard.go` | Drives a transformer from wasm-go's `ProcessStreamingRequestBodyWithAction` hook: holds the request headers (ActionPause) until a 64KB commit point, calls the plugin's `OnCommit` to apply header / context side effects, falls back to the plugin's buffered handler when a shape is unsupported before the commit point, fails the request (500) after it. Three shapes: `Transform` (whole body), `PrefixTransform` (rewrites at the start, rest forwarded without scanning), `Observe` (read-only, input forwarded as is). |
 
 ## Actions a protocol can return
 
@@ -42,9 +45,10 @@ Keys with escape sequences are decoded before dispatch. Only UTF-8 validity is n
 ## Correctness
 
 Each protocol is checked against the original implementation in the same package tests:
-hand-written cases × chunk sizes 1/7/4096 plus randomized fuzzing (`provider/streamxform_*_test.go`,
-`STREAMXFORM_FUZZ_N` scales the fuzz size). `../streaming_request_test.go` drives the whole plugin through
-the wasm-go host emulator chunk by chunk (Pause / Continue / fallback / 500 / passthrough).
+hand-written cases × chunk sizes 1/7/4096 plus randomized fuzzing (`ai-proxy/provider/streamxform_*_test.go`,
+`STREAMXFORM_FUZZ_N` scales the fuzz size). `ai-proxy/streaming_request_test.go`, `model-router/stream_test.go`
+and `ai-statistics/observer_*_test.go` drive the plugins through the wasm-go host emulator chunk by chunk
+(Pause / Continue / fallback / 500 / passthrough); `KeyProbe` rewrites are compared byte for byte with `sjson`.
 `bench_test.go` measures scanner throughput (long strings, base64, dense tool schemas); the string body is
 scanned eight bytes at a time, so validation costs nothing on the bytes that dominate large requests.
 
@@ -56,6 +60,27 @@ first 64KB the `Accept` header is not rewritten (providers decide streaming by t
 path sorts keys and reformats numbers through float64, losing precision on large integers) — same meaning,
 the client's literals preserved.
 
+## Using it from a plugin
+
+```go
+tr := streamxform.NewKeyProbe(streamxform.KeyProbeOptions{          // top-level keys only, rest verbatim
+    Keys: map[string]int{"model": 4096}, ModelKey: "model",
+    OnKey: func(t *streamxform.Transformer, key string, raw []byte) ([]byte, bool) { /* rewrite? */ },
+})
+st := guard.New(&guard.Plan{
+    Tr: tr, Mode: guard.PrefixTransform,
+    OnCommit: func(pre streamxform.Prelude, last bool) bool { /* set headers; false → fall back */ },
+    Fallback: func(body []byte) types.Action { return onHttpRequestBody(ctx, cfg, body) }, // buffered path
+    Metric: guard.NewMetric("my_plugin.stream"), Log: log.Warnf,
+})
+// in the hook registered with wrapper.ProcessStreamingRequestBodyWithAction:
+return st.Feed(chunk, isLastChunk)
+```
+
+Register the streaming hook next to `ProcessRequestBody` (the buffered handler stays as the fallback) and
+call `ctx.BufferRequestBody()` in the header phase for requests the streaming path should not handle.
+`model-router/stream.go` and `ai-statistics/observer.go` are complete examples (about 100 lines each).
+
 ## Adding a protocol
 
 1. Read the buffered transform for the provider and list every field it reads and every output field.
@@ -63,5 +88,5 @@ the client's literals preserved.
    stream long ones, put aggregated output in `Tail`. Mount sub-hooks (`ToolsHook`) with `Enter().Via` for
    shared OpenAI sub-structures. Anything you cannot express → `Bail`.
 3. Add a differential test that calls the original builder and compares field by field.
-4. Register it in `provider/streamhooks.go` (`NewStreamPlan`), including any header / context side effects
-   and the pre-commit requirements (`RequireModelBeforeCommit` / `RequireStreamBeforeCommit`).
+4. Register it in `ai-proxy/provider/streamhooks.go` (`NewStreamPlan`), including any header / context side
+   effects and the pre-commit requirements (`RequireModelBeforeCommit` / `RequireStreamBeforeCommit`).

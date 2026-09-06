@@ -27,6 +27,18 @@
 | `pattern` | string   | 必填     | 正则表达式，用于匹配用户消息内容                             |
 | `model`   | string   | 必填     | 匹配成功时设置的模型名称，将设置到 `x-higress-llm-model` 请求头 |
 
+## 请求体流式处理
+
+JSON 请求体且 `modelKey` 是顶层普通字段时，插件不再缓冲整份请求体：只在请求体开头（64KB 窗口）内寻找 `model`，
+找到后立即设置路由请求头、原位改写 `model` 字段（与 sjson 改写逐字节一致），之后的字节原样转发、不再扫描。
+单个请求占用的内存与请求体大小无关。
+
+以下情形自动走原来的全量缓冲路径，结果与之前完全一致：`multipart/form-data`、`modelKey` 是 gjson 路径（含 `.` 等）、
+自动路由（需要读最后一条 user 消息）、`model` 不是字符串、窗口内没有出现 `model`（如 SDK 把很长的 `messages` 放在 `model` 之前）、
+窗口内出现 JSON 语法错误。
+
+指标：`model_router.stream.streamed` / `fallback`（Envoy 统计前缀 `wasmcustom.`）。
+
 ## 运行属性
 
 插件执行阶段：认证阶段

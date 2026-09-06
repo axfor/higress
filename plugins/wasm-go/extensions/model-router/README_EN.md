@@ -11,6 +11,20 @@ The `model-router` plugin implements routing functionality based on the model pa
 | `enableOnPathSuffix` | array of string | Optional                | ["/completions","/embeddings","/images/generations","/audio/speech","/fine_tuning/jobs","/moderations","/image-synthesis","/video-synthesis","/rerank","/messages"] | Only effective for requests with these specific path suffixes, can be configured as "*" to match all paths |
 | `keepOriginalModelName` | bool         | Optional                | false                    | Used with `addProviderHeader`. When set to true, the provider is still extracted into the header, but the model field in the request body is not rewritten |
 
+## Streaming request body
+
+For JSON bodies whose `modelKey` is a plain top-level field the plugin no longer buffers the whole request:
+it looks for `model` only within the first 64KB, sets the routing headers as soon as it is found, rewrites the
+`model` field in place (byte-identical to the sjson rewrite) and forwards the rest of the body untouched
+without scanning it. Memory per request is independent of the body size.
+
+The original buffered path is used automatically, with identical results, for `multipart/form-data`, a
+`modelKey` written as a gjson path, auto routing (it needs the last user message), a non-string `model`,
+a `model` that does not appear within the window (SDKs that put a large `messages` array first), or a JSON
+syntax error inside the window.
+
+Metrics: `model_router.stream.streamed` / `fallback` (Envoy stats prefix `wasmcustom.`).
+
 ## Runtime Properties
 
 Plugin execution phase: Authentication phase
