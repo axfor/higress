@@ -30,7 +30,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-// TODO(PR): 依赖 wasm-go 新增的 ProcessStreamingRequestBodyWithAction，合入后改为版本号
-replace github.com/higress-group/wasm-go => /Users/axx/wasm-go
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906121024-f20b96bc94d0
 
 replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/streamxform
