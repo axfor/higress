@@ -13,21 +13,21 @@ import (
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform/guard"
 )
 
-// 请求体流式路径。
+// Streaming request body path.
 //
-// 官方实现把整份 body 缓冲（上限 100MB）后用 gjson 取 model、sjson 改写；这里只在 body 开头
-// （streamxform.CommitBytes 的窗口内）找 model：找到就设请求头、原位改写，之后的字节原样直通、不再扫描。
-// 以下情形保持官方全量路径，结果与官方逐字节一致：
-//   - 非 JSON（multipart）、modelKey 不是顶层普通 key、没有 content-type；
-//   - auto 路由命中（要看最后一条 user 消息）、model 不是字符串；
-//   - 窗口内没见到 model（SDK 把 messages 放前面且超过窗口）。
-// 已知差异：body 后半段有 JSON 语法错误时，官方 json.Valid 失败会整体不动，流式已按开头改写并原样送出剩余字节。
+// The buffered implementation collects the whole body (up to 100MB), reads model with gjson and rewrites it with sjson. Here
+// model is only looked for at the start of the body (within the streamxform.CommitBytes window): once found the headers are set
+// and it is rewritten in place; the bytes after that are forwarded verbatim without scanning. These cases keep the buffered path, byte-identical to it:
+//   - non-JSON (multipart), a modelKey that is not a plain top-level key, no content-type;
+//   - an auto route match (needs the last user message), a model that is not a string;
+//   - model not seen inside the window (SDKs that put messages first, beyond the window).
+// Known difference: with a JSON syntax error late in the body the buffered json.Valid fails and nothing is changed, while streaming has already rewritten the start and forwards the rest verbatim.
 
 const ctxKeyStream = "model_router_stream"
 
 var streamMetric = guard.NewMetric("model_router.stream")
 
-// streamable 报告这次请求能否走流式路径。
+// streamable reports whether this request can take the streaming path.
 func streamable(config ModelRouterConfig, contentType string) bool {
 	if !strings.Contains(contentType, "application/json") || config.modelKey == "" {
 		return false
@@ -35,7 +35,7 @@ func streamable(config ModelRouterConfig, contentType string) bool {
 	for i := 0; i < len(config.modelKey); i++ {
 		c := config.modelKey[i]
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
-			return false // gjson 路径语法（. # * ? @ | \）：交给官方路径
+			return false // gjson path syntax (. # * ? @ | \): leave it to the buffered path
 		}
 	}
 	return true
@@ -44,8 +44,8 @@ func streamable(config ModelRouterConfig, contentType string) bool {
 type jsonRoute struct {
 	config   ModelRouterConfig
 	model    string
-	modelOK  bool // 见到了字符串 model
-	needFull bool // 必须整份 body：auto 路由 / 非字符串 model
+	modelOK  bool // a string model was seen
+	needFull bool // the whole body is required: auto route / non-string model
 }
 
 func newStream(ctx wrapper.HttpContext, config ModelRouterConfig) *guard.State {
@@ -65,11 +65,11 @@ func newStream(ctx wrapper.HttpContext, config ModelRouterConfig) *guard.State {
 	})
 }
 
-// onModel：model 值到齐。决定是否原位改写（provider/model 去前缀）。
+// onModel: the model value is complete. Decides whether to rewrite in place (strip the provider/ prefix).
 func (r *jsonRoute) onModel(t *streamxform.Transformer, key string, raw []byte) ([]byte, bool) {
 	var s string
 	if json.Unmarshal(raw, &s) != nil {
-		r.needFull = true // 官方对非字符串走 gjson 的 String() 语义，交给全量路径复刻
+		r.needFull = true // the buffered path applies gjson String() semantics to non-strings: let the full path reproduce that
 		return nil, false
 	}
 	r.model, r.modelOK = s, true
@@ -88,13 +88,13 @@ func (r *jsonRoute) onModel(t *streamxform.Transformer, key string, raw []byte) 
 	return nil, false
 }
 
-// commit：放行请求头之前。与官方 handleJsonBody 设头的顺序一致。
+// commit: before the headers are released. Same header order as the buffered handleJsonBody.
 func (r *jsonRoute) commit(pre streamxform.Prelude, last bool) bool {
 	if r.needFull {
 		return false
 	}
 	if !r.modelOK {
-		return last // 整份都到了还没有 model：官方不动；否则 model 可能在窗口之外，回落
+		return last // the whole body arrived without a model: the buffered path leaves it alone; otherwise model may be beyond the window, fall back
 	}
 	if r.model == "" {
 		return true
@@ -114,7 +114,7 @@ func (r *jsonRoute) commit(pre streamxform.Prelude, last bool) bool {
 	return true
 }
 
-// sjsonString 复刻 sjson 的字符串编码：纯可见 ASCII 直接加引号，否则走 encoding/json。
+// sjsonString reproduces sjson's string encoding: plain printable ASCII is just quoted, anything else goes through encoding/json.
 func sjsonString(s string) []byte {
 	for i := 0; i < len(s); i++ {
 		if s[i] < ' ' || s[i] > 0x7f || s[i] == '"' || s[i] == '\\' {

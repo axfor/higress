@@ -147,7 +147,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelRouterConfig) typ
 	// 100MB buffer limit
 	ctx.SetRequestBodyBufferLimit(DefaultMaxBodyBytes)
 
-	// JSON 且 modelKey 是顶层普通 key：流式路径（见 stream.go）；其余走官方全量路径
+	// JSON with a plain top-level modelKey: streaming path (see stream.go); everything else takes the buffered path
 	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
 	if !streamable(config, contentType) {
 		ctx.BufferRequestBody()

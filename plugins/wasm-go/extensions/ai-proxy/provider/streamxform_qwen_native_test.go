@@ -11,10 +11,10 @@ import (
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 )
 
-// officialQwenNative：qwen.go onChatCompletionRequestBody 的纯函数部分
-// （parseRequestAndMapModel 的 decode + 空 model 校验 + 映射 → buildQwenTextGenerationRequest）。
+// officialQwenNative is the pure-function part of qwen.go onChatCompletionRequestBody
+// (the decode of parseRequestAndMapModel + empty model check + mapping → buildQwenTextGenerationRequest).
 func officialQwenNativeErr(in string, mapping map[string]string, enableSearch bool) (map[string]any, error) {
-	body, err := convertDeveloperRoleToSystem([]byte(in)) // handleRequestBody 对 qwen 会做这一步
+	body, err := convertDeveloperRoleToSystem([]byte(in)) // handleRequestBody does this step for qwen
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +34,7 @@ func officialQwenNativeErr(in string, mapping map[string]string, enableSearch bo
 	return decodeMap(body)
 }
 
-// qwenCtxStub 只需要 SetContext（官方在 streaming 时写 incrementalStreaming 上下文键）
+// qwenCtxStub only needs SetContext (the buffered path writes the incrementalStreaming context key when streaming)
 type qwenCtxStub struct{ wrapper.HttpContext }
 
 func (qwenCtxStub) SetContext(string, interface{}) {}
@@ -95,20 +95,20 @@ func TestQwenNativeDifferential(t *testing.T) {
 				str, sok, why := runStream(newQwenNativeStream(search), in, cs)
 				if oerr != nil {
 					if sok {
-						t.Errorf("官方失败但流式放行: %s (%v)", trunc(in, 80), oerr)
+						t.Errorf("buffered path failed but streaming passed: %s (%v)", trunc(in, 80), oerr)
 					} else if cs == 4096 && !search {
-						fmt.Printf("  %-60s 官方失败，流式回落 ✓ (%s)\n", trunc(in, 60), why)
+						fmt.Printf("  %-60s buffered path failed, streaming fell back ✓ (%s)\n", trunc(in, 60), why)
 					}
 					continue
 				}
 				if !sok {
-					t.Errorf("chunk=%d 意外回落: %s\n  %s", cs, why, in)
+					t.Errorf("chunk=%d unexpected fallback: %s\n  %s", cs, why, in)
 					continue
 				}
 				if d := diffMaps(off, str); d != "" {
-					t.Errorf("chunk=%d search=%v 不一致: %s\n  输入: %s", cs, search, d, trunc(in, 200))
+					t.Errorf("chunk=%d search=%v mismatch: %s\n  input: %s", cs, search, d, trunc(in, 200))
 				} else if cs == 4096 && !search {
-					fmt.Printf("  %-60s ✓ 一致\n", trunc(in, 60))
+					fmt.Printf("  %-60s ✓ identical\n", trunc(in, 60))
 				}
 			}
 		}
@@ -136,7 +136,7 @@ func TestQwenNativeFuzz(t *testing.T) {
 					lenient++
 					continue
 				}
-				t.Fatalf("第 %d 例官方失败但流式放行 (chunk=%d): %v\n  输入: %s", i, chunk, oerr, in)
+				t.Fatalf("case %d: buffered path failed but streaming passed (chunk=%d): %v\n  input: %s", i, chunk, oerr, in)
 			}
 			continue
 		}
@@ -145,12 +145,12 @@ func TestQwenNativeFuzz(t *testing.T) {
 				fb++
 				continue
 			}
-			t.Fatalf("第 %d 例意外回落 (chunk=%d): %s\n  输入: %s", i, chunk, why, in)
+			t.Fatalf("case %d: unexpected fallback (chunk=%d): %s\n  input: %s", i, chunk, why, in)
 		}
 		if d := diffMaps(off, str); d != "" {
-			t.Fatalf("第 %d 例不一致 (chunk=%d)\n  输入: %s\n  差异: %s", i, chunk, in, d)
+			t.Fatalf("case %d: mismatch (chunk=%d)\n  input: %s\n  diff: %s", i, chunk, in, d)
 		}
 		same++
 	}
-	fmt.Printf("  Qwen 原生随机 %d 例 (seed=%d): 一致 %d, 官方失败 %d (其中丢弃字段类型错误、流式放行 %d), 已知回落 %d, 不一致 0\n", N, seed, same, offFail, lenient, fb)
+	fmt.Printf("  native Qwen random %d cases (seed=%d): identical %d, buffered failed %d (of which dropped-field type errors passed by streaming %d), known fallbacks %d, mismatches 0\n", N, seed, same, offFail, lenient, fb)
 }

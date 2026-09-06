@@ -1,14 +1,14 @@
-// Package guard 是流式请求体转换的集成层（层 3）：把 Transformer 接到 wasm-go 的
-// ProcessStreamingRequestBodyWithAction 钩子上，负责提交点、回落与失败的控制流。
+// Package guard is the integration layer (layer 3) of streaming request body transformation: it connects a
+// Transformer to the ProcessStreamingRequestBodyWithAction hook of wasm-go and owns the control flow of the commit point, fallback and failure.
 //
-// 三种形态：
-//   - Transform：整份 body 经转换器（ai-proxy 的协议转换）。提交点后判定不支持只能失败。
-//   - PrefixTransform：改写都发生在 body 开头（如 model-router 改 model）。提交点前经转换器，
-//     放行之后剩余字节原样直通、不再扫描——CPU 接近零，语法错误也与官方一样原样送上游。
-//   - Observe：只看不改（如 ai-statistics 数轮次、取 model）。输入原样转发，判定不支持只停止观察。
+// Three modes:
+//   - Transform: the whole body goes through the transformer (ai-proxy protocol conversion). Bailing after the commit point can only fail.
+//   - PrefixTransform: every rewrite happens at the start of the body (model-router rewriting model). The transformer sees the
+//     bytes before the commit point; after release the rest is forwarded verbatim without scanning: near-zero CPU, and syntax errors reach the upstream unchanged, as on the buffered path.
+//   - Observe: look but do not touch (ai-statistics counting turns, reading model). Input is forwarded as is; bailing only stops observing.
 //
-// 提交点（streamxform.CommitBytes）之前返回 ActionPause：原始字节留在宿主缓冲区，请求头扣住；
-// 这期间判定不支持可以干净回落到插件的官方全量路径（Fallback）。
+// Before the commit point (streamxform.CommitBytes) it returns ActionPause: the raw bytes stay in the host buffer and the request
+// headers are held; bailing during that window falls back cleanly to the plugin's buffered path (Fallback).
 package guard
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 )
 
-// Mode 是驱动形态。
+// Mode is the driving mode.
 type Mode uint8
 
 const (
@@ -27,42 +27,51 @@ const (
 	Observe
 )
 
-// Plan 描述一次请求的流式处理。
+// Plan describes the streaming handling of one request.
 type Plan struct {
 	Tr   *streamxform.Transformer
 	Mode Mode
-	// Passthrough：官方对 body 一个字节都不动，逐块直接放行，不经转换器（Tr 可为 nil）。
+	// Passthrough: the buffered path does not touch the body at all; chunks are released directly without the transformer (Tr may be nil).
 	Passthrough bool
-	// OnCommit 在首次放行（请求头下发）之前调用；返回 false 表示要回落——此时还没放行任何字节。
-	// 依赖 body 事实的请求头 / 上下文键在这里施加。
+	// OnCommit is called before the first release (headers sent); returning false asks for a fallback while nothing has been released yet.
+	// Request headers and context keys that depend on body facts are applied here.
 	OnCommit func(pre streamxform.Prelude, last bool) bool
-	// OnFinish 在整份 body 处理完（最后一块）时调用。
+	// OnFinish is called when the whole body has been handled (last chunk).
 	OnFinish func(pre streamxform.Prelude)
-	// Fallback 是插件的官方全量路径：收齐整份 body 后调用。官方 handler 若自行 ReplaceHttpRequestBody，
-	// 驱动会把它写回的内容读回并作为本次返回值。返回 ActionPause 表示官方已本地应答或在等异步结果。
+	// Fallback is the plugin's buffered path, called once the whole body is collected. If the buffered handler calls
+	// ReplaceHttpRequestBody itself, the driver reads that content back and returns it. ActionPause means the handler answered locally or waits for an async result.
 	Fallback func(body []byte) types.Action
-	// Uncoverable：提交点后判定不支持（Transform 形态）。nil 时本地应答 500。
+	// Uncoverable: bailed after the commit point (Transform mode). nil answers 500 locally.
 	Uncoverable func(reason string)
-	// Metric 计数：streamed / fallback / uncoverable / observe_bailed。可为 nil。
+	// Metric counts streamed / fallback / uncoverable / observe_bailed. May be nil.
 	Metric func(name string)
-	// Log 警告日志。可为 nil。
+	// Log is the warning logger. May be nil.
 	Log func(format string, args ...interface{})
 }
 
-// State 是一次请求的驱动状态。
+// State is the driving state of one request.
 type State struct {
 	plan     *Plan
 	total    int
 	fallback bool
 	sent     bool
-	raw      bool // PrefixTransform：已放行，剩余原样直通
-	dead     bool // Observe：已停止观察
+	raw      bool   // PrefixTransform: released, the rest is forwarded verbatim
+	dead     bool   // Observe: observation stopped
+	out      []byte // output of the current Feed, filled by the transformer's sink and reused across chunks
 }
 
-// New 构造驱动状态。
-func New(p *Plan) *State { return &State{plan: p} }
+// New builds the driving state. In the transforming modes the transformer delivers its output through a sink into a
+// buffer this state reuses from chunk to chunk: the host copies the returned bytes synchronously, so neither side allocates
+// per chunk and a request no longer produces as much garbage as it has body.
+func New(p *Plan) *State {
+	s := &State{plan: p}
+	if p.Tr != nil && p.Mode != Observe && !p.Passthrough {
+		p.Tr.SetSink(func(b []byte) { s.out = append(s.out, b...) })
+	}
+	return s
+}
 
-// Prelude 取转换器协议报告的 Prelude（协议不实现 Preluder 时为零值）。
+// Prelude returns the Prelude reported by the transformer's protocol (zero value when it does not implement Preluder).
 func Prelude(tr *streamxform.Transformer) streamxform.Prelude {
 	if tr == nil {
 		return streamxform.Prelude{}
@@ -73,7 +82,7 @@ func Prelude(tr *streamxform.Transformer) streamxform.Prelude {
 	return streamxform.Prelude{}
 }
 
-// 可替换（测试）
+// replaceable (tests)
 var (
 	hostRequestBody = proxywasm.GetHttpRequestBody
 	hostSendError   = func(reason string) {
@@ -87,14 +96,14 @@ func (s *State) metric(name string) {
 	}
 }
 
-// bailed 记一次判定不支持：总计数 + 按分类的计数（fallback.duplicate_key、uncoverable.limit……）。
-// 分类来自引擎的 Error.Code，不匹配文案；非引擎原因（OnCommit 要求回落）用调用方给的名字。
+// bailed records one bail: the total counter plus a per-code counter (fallback.duplicate_key, uncoverable.limit, ...).
+// The code comes from the engine's Error.Code, never from the message text; non-engine reasons (OnCommit asking to fall back) use the name the caller gives.
 func (s *State) bailed(kind, code string) {
 	s.metric(kind)
 	s.metric(kind + "." + code)
 }
 
-// codeOf 取转换器判定不支持的分类名。
+// codeOf returns the code name of the transformer's bail.
 func codeOf(tr *streamxform.Transformer) string {
 	if tr == nil || tr.Err() == nil {
 		return "none"
@@ -108,7 +117,7 @@ func (s *State) logf(format string, args ...interface{}) {
 	}
 }
 
-// Feed 喂一块请求体，返回要下发的字节与动作。
+// Feed takes one chunk of the request body and returns the bytes to forward and the action.
 func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	s.total += len(chunk)
 	if s.fallback {
@@ -117,7 +126,7 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	if s.plan.Passthrough || s.raw {
 		if !s.sent {
 			if s.plan.OnCommit != nil && !s.plan.OnCommit(Prelude(s.plan.Tr), last) {
-				return s.toFallback(last, "OnCommit 要求回落", "oncommit")
+				return s.toFallback(last, "OnCommit asked for a fallback", "oncommit")
 			}
 			s.sent = true
 			s.metric("streamed")
@@ -134,12 +143,12 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 			if last {
 				tr.Finish()
 			}
-			tr.Out() // 观察形态的输出没人要，取走以免积累
+			tr.Out() // nobody wants the output in Observe mode; take it so it does not accumulate
 			if bad, why := tr.Unsupported(); bad {
 				s.dead = true
 				code := codeOf(tr)
 				s.bailed("observe_bailed", code)
-				s.logf("[streamxform] 停止观察 (%s): %s (received=%d)", code, why, s.total)
+				s.logf("[streamxform] observation stopped (%s): %s (received=%d)", code, why, s.total)
 			}
 		}
 		if !s.sent {
@@ -154,16 +163,16 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		}
 		return chunk, types.ActionContinue
 	}
+	s.out = s.out[:0]
 	tr.Write(chunk)
-	var fin []byte
 	if last {
-		fin = tr.Finish() // Finish 把缓冲里剩余的输出一并取走，下面不能再指望 Out()
+		tr.Finish() // the remaining output arrives through the sink as well
 	}
 	if bad, why := tr.Unsupported(); bad {
 		code := codeOf(tr)
 		if tr.Committed() && s.sent {
-			// 已越过提交点：部分字节已发给上游，无法回落，只能失败。
-			s.logf("[streamxform] 提交点之后判定不支持 (%s)，请求失败: %s", code, why)
+			// Past the commit point: some bytes already went upstream, no fallback is possible, only failure.
+			s.logf("[streamxform] bailed after the commit point (%s), failing the request: %s", code, why)
 			s.bailed("uncoverable", code)
 			if s.plan.Uncoverable != nil {
 				s.plan.Uncoverable(why)
@@ -175,70 +184,70 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		return s.toFallback(last, why, code)
 	}
 	if !tr.Committed() {
-		return nil, types.ActionPause // 提交点之前：留在宿主缓冲区，继续攒
+		return nil, types.ActionPause // before the commit point: stay in the host buffer and keep collecting
 	}
 	if !s.sent {
 		if s.plan.OnCommit != nil && !s.plan.OnCommit(Prelude(tr), last) {
-			return s.toFallback(last, "提交点前未满足放行条件", "oncommit")
+			return s.toFallback(last, "release condition not met before the commit point", "oncommit")
 		}
 		s.sent = true
 		s.metric("streamed")
 	}
-	out := append(tr.Out(), fin...)
+	out := s.out
 	if last {
 		if s.plan.OnFinish != nil {
 			s.plan.OnFinish(Prelude(tr))
 		}
 	} else if s.plan.Mode == PrefixTransform {
-		s.raw = true // 改写只在开头：之后原样直通，不再扫描
+		s.raw = true // rewrites only happen at the start: forward the rest verbatim, no more scanning
 		s.plan.Tr = nil
 	}
 	return out, types.ActionContinue
 }
 
 func (s *State) toFallback(last bool, why, code string) ([]byte, types.Action) {
-	s.logf("[streamxform] 回落到官方全量路径 (%s): %s (received=%d last=%v)", code, why, s.total, last)
+	s.logf("[streamxform] falling back to the buffered path (%s): %s (received=%d last=%v)", code, why, s.total, last)
 	s.bailed("fallback", code)
 	s.fallback = true
 	s.plan.Tr = nil
 	return s.feedFallback(last)
 }
 
-// feedFallback：官方全量路径。攒到末块，从宿主缓冲区取全量 body 交给官方 handler。
+// feedFallback is the buffered path: collect until the last chunk, then take the whole body from the host buffer and hand it to the buffered handler.
 func (s *State) feedFallback(last bool) ([]byte, types.Action) {
 	if !last {
 		return nil, types.ActionPause
 	}
 	body, err := hostRequestBody(0, s.total)
 	if err != nil {
-		s.logf("[streamxform] 回落路径读取 body 失败: %v", err)
+		s.logf("[streamxform] fallback path failed to read the body: %v", err)
 		return nil, types.ActionContinue
 	}
 	if s.plan.Fallback == nil {
 		return body, types.ActionContinue
 	}
-	// 官方 handler 会自己 ReplaceHttpRequestBody；这里的返回值会再覆盖一次，所以把它写回的内容读回来返回。
+	// The buffered handler calls ReplaceHttpRequestBody itself and our return value would overwrite it, so read back what it wrote and return that.
 	if s.plan.Fallback(body) == types.ActionPause {
 		return nil, types.ActionPause
 	}
-	nb, err := hostRequestBody(0, 1<<30) // 上限只是读取上限：官方转换后的 body 可能比输入大
+	nb, err := hostRequestBody(0, 1<<30) // only a read limit: the converted body may be larger than the input
 	if err != nil {
 		return body, types.ActionContinue
 	}
 	return nb, types.ActionContinue
 }
 
-// Sent 报告是否已放行过（请求头已下发）。
+// Sent reports whether anything has been released (request headers sent).
 func (s *State) Sent() bool { return s.sent }
 
-// FellBack 报告是否已切到官方全量路径。
+// FellBack reports whether the request switched to the buffered path.
 func (s *State) FellBack() bool { return s.fallback }
 
-// ForceFallback 让本次请求从一开始就走官方全量路径（插件判定不适用流式时）。
+// ForceFallback makes this request take the buffered path from the start (when the plugin decides streaming does not apply).
 func (s *State) ForceFallback() { s.fallback = true; s.plan.Tr = nil }
 
-// NewMetric 返回一个按名字计数的函数：prefix + "." + name。
-// 指标只是观测手段：宿主不支持（测试模拟器、或禁用了 metrics 的部署）时静默关闭，绝不能影响请求。
+// NewMetric returns a counter function keyed by name: prefix + "." + name.
+// Metrics are observation only: when the host does not support them (the test emulator, or a deployment with metrics disabled) they switch off silently and never affect the request.
 func NewMetric(prefix string) func(name string) {
 	counters := map[string]proxywasm.MetricCounter{}
 	off := false

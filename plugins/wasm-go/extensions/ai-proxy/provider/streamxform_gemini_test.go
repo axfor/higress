@@ -12,9 +12,9 @@ import (
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 )
 
-// officialGemini：gemini.go onChatCompletionRequestBody 的纯函数部分
-// （parseRequestAndMapModel 的 decode + 空 model 校验 → buildGeminiChatRequest → Marshal）。
-// 官方随后会对 http(s) 图片异步抓取，这里返回 needFetch=true 表示该形态流式必须回落。
+// officialGemini is the pure-function part of gemini.go onChatCompletionRequestBody
+// (the decode of parseRequestAndMapModel + empty model check → buildGeminiChatRequest → Marshal).
+// The buffered path then fetches http(s) images asynchronously; needFetch=true says that shape must fall back when streaming.
 func officialGemini(in string, safety map[string]string, budget int64) (m map[string]any, ok bool, needFetch bool) {
 	m, err, needFetch := officialGeminiErr(in, safety, budget)
 	return m, err == nil, needFetch
@@ -28,7 +28,7 @@ func officialGeminiErr(in string, safety map[string]string, budget int64) (m map
 	if req.Model == "" {
 		return nil, fmt.Errorf("missing model in request"), false
 	}
-	req.Model = gemMapping(req.Model) // parseRequestAndMapModel 会把映射结果写回 request.Model
+	req.Model = gemMapping(req.Model) // parseRequestAndMapModel writes the mapped model back into request.Model
 	g := &geminiProvider{config: ProviderConfig{geminiSafetySetting: safety, geminiThinkingBudget: budget}}
 	gr := g.buildGeminiChatRequest(req)
 	if g.countImageUrl(gr) > 0 {
@@ -39,7 +39,7 @@ func officialGeminiErr(in string, safety map[string]string, budget int64) (m map
 		return nil, err, false
 	}
 	m, _ = decodeMap(b)
-	// safetySettings 来自 map 遍历，顺序不定：排序后比对
+	// safetySettings comes from a map iteration with no fixed order: sort before comparing
 	if ss, ok := m["safetySettings"].([]any); ok {
 		sort.Slice(ss, func(i, j int) bool {
 			return ss[i].(map[string]any)["category"].(string) < ss[j].(map[string]any)["category"].(string)
@@ -127,22 +127,22 @@ func TestGeminiDifferential(t *testing.T) {
 				str, sok, why := runStream(newGeminiStream(safety, 1024), in, cs)
 				if !ok {
 					if sok {
-						t.Errorf("官方失败但流式放行: %s", trunc(in, 80))
+						t.Errorf("buffered path failed but streaming passed: %s", trunc(in, 80))
 					} else if cs == 4096 && safety {
-						fmt.Printf("  %-60s 官方失败，流式回落 ✓ (%s)\n", trunc(in, 60), why)
+						fmt.Printf("  %-60s buffered path failed, streaming fell back ✓ (%s)\n", trunc(in, 60), why)
 					}
 					continue
 				}
 				if needFetch {
 					if sok {
-						t.Errorf("含 http 图片应回落却放行了: %s", trunc(in, 80))
+						t.Errorf("an http image should fall back but passed: %s", trunc(in, 80))
 					} else if cs == 4096 && safety {
-						fmt.Printf("  %-60s http 图片 → 回落 ✓\n", trunc(in, 60))
+						fmt.Printf("  %-60s http image → fallback ✓\n", trunc(in, 60))
 					}
 					continue
 				}
 				if !sok {
-					t.Errorf("chunk=%d 意外回落: %s\n  %s", cs, why, in)
+					t.Errorf("chunk=%d unexpected fallback: %s\n  %s", cs, why, in)
 					continue
 				}
 				if ss, ok := str["safetySettings"].([]any); ok {
@@ -151,9 +151,9 @@ func TestGeminiDifferential(t *testing.T) {
 					})
 				}
 				if d := diffMaps(off, str); d != "" {
-					t.Errorf("chunk=%d safety=%v 不一致: %s\n  输入: %s", cs, safety, d, trunc(in, 200))
+					t.Errorf("chunk=%d safety=%v mismatch: %s\n  input: %s", cs, safety, d, trunc(in, 200))
 				} else if cs == 4096 && safety {
-					fmt.Printf("  %-60s ✓ 一致\n", trunc(in, 60))
+					fmt.Printf("  %-60s ✓ identical\n", trunc(in, 60))
 				}
 			}
 		}
@@ -182,17 +182,17 @@ func TestGeminiFuzz(t *testing.T) {
 			offFail++
 			if sok {
 				if isDiscardedFieldTypeErrorIn(oerr, geminiExtraDiscarded) {
-					lenient++ // 被丢弃字段的类型错误：已知宽松差异
+					lenient++ // type error in a dropped field: known lenient difference
 					continue
 				}
-				t.Fatalf("第 %d 例官方失败但流式放行 (chunk=%d): %v\n  输入: %s", i, chunk, oerr, in)
+				t.Fatalf("case %d: buffered path failed but streaming passed (chunk=%d): %v\n  input: %s", i, chunk, oerr, in)
 			}
 			continue
 		}
 		if needFetch {
 			fetch++
 			if sok {
-				t.Fatalf("第 %d 例含 http 图片应回落却放行 (chunk=%d)\n  输入: %s", i, chunk, in)
+				t.Fatalf("case %d: an http image should fall back but passed (chunk=%d)\n  input: %s", i, chunk, in)
 			}
 			continue
 		}
@@ -201,7 +201,7 @@ func TestGeminiFuzz(t *testing.T) {
 				fb++
 				continue
 			}
-			t.Fatalf("第 %d 例意外回落 (chunk=%d): %s\n  输入: %s", i, chunk, why, in)
+			t.Fatalf("case %d: unexpected fallback (chunk=%d): %s\n  input: %s", i, chunk, why, in)
 		}
 		if ss, ok := str["safetySettings"].([]any); ok {
 			sort.Slice(ss, func(i, j int) bool {
@@ -209,9 +209,9 @@ func TestGeminiFuzz(t *testing.T) {
 			})
 		}
 		if d := diffMaps(off, str); d != "" {
-			t.Fatalf("第 %d 例不一致 (chunk=%d)\n  输入: %s\n  差异: %s", i, chunk, in, d)
+			t.Fatalf("case %d: mismatch (chunk=%d)\n  input: %s\n  diff: %s", i, chunk, in, d)
 		}
 		same++
 	}
-	fmt.Printf("  Gemini 随机 %d 例 (seed=%d): 一致 %d, 官方失败 %d (其中丢弃字段类型错误、流式放行 %d), http 图片回落 %d, 已知回落 %d, 不一致 0\n", N, seed, same, offFail, lenient, fetch, fb)
+	fmt.Printf("  Gemini random %d cases (seed=%d): identical %d, buffered failed %d (of which dropped-field type errors passed by streaming %d), http image fallbacks %d, known fallbacks %d, mismatches 0\n", N, seed, same, offFail, lenient, fetch, fb)
 }

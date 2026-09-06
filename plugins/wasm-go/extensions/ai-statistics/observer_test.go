@@ -11,7 +11,7 @@ import (
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 )
 
-// 官方逻辑（gjson）：取 model 与 user 轮数。
+// buffered logic (gjson): read model and count user turns.
 func officialModelAndRounds(body []byte) (string, int) {
 	requestModel := "UNKNOWN"
 	if m := gjson.GetBytes(body, "model"); m.Exists() {
@@ -117,7 +117,7 @@ func TestObserverMatchesOfficial(t *testing.T) {
 		for _, cs := range []int{1, 3, 4096} {
 			gm, gn, ok := observe([]byte(body), cs)
 			if !ok {
-				t.Fatalf("%s chunk=%d: 观察被判定不支持", body, cs)
+				t.Fatalf("%s chunk=%d: observation was marked unsupported", body, cs)
 			}
 			if gm != wm || gn != wn {
 				t.Fatalf("%s chunk=%d: got (%q,%d) want (%q,%d)", body, cs, gm, gn, wm, wn)

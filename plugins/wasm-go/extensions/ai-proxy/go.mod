@@ -15,7 +15,7 @@ require (
 )
 
 require (
-	github.com/axfor/ason v0.0.0-20260906141048-38e1a2861ffa // indirect
+	github.com/axfor/ason v0.0.0-20260906152903-3503cb2e3348 // indirect
 	github.com/tetratelabs/wazero v1.7.2 // indirect
 )
 
@@ -30,6 +30,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906121024-f20b96bc94d0
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432
 
 replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/streamxform

@@ -361,14 +361,14 @@ func contentLengthExceedsLimit(contentLength string, limit uint32) bool {
 	return length > uint64(limit)
 }
 
-// onHttpStreamingRequestBody 流式处理请求体（层 3：Guard）。
+// onHttpStreamingRequestBody handles the request body chunk by chunk (layer 3: Guard).
 //
-// 请求头在 header 阶段被扣住（HeaderStopIteration），直到本函数第一次返回 ActionContinue。
-// 所以提交点之前一律返回 ActionPause：原始字节留在 Envoy 缓冲区（上限 CommitBytes 量级），
-// 转换器的输出也攒着。这段窗口内判定不支持，就切到官方全量路径，干净回落；
-// 越过提交点后再判定不支持，字节已经发给上游收不回来，只能让请求失败。
+// The request headers are held in the header phase (HeaderStopIteration) until this function first returns ActionContinue.
+// So before the commit point it always returns ActionPause: the raw bytes stay in the Envoy buffer (on the order of CommitBytes)
+// and the transformer's output is kept as well. A bail inside that window switches to the buffered path, a clean fallback;
+// a bail after the commit point cannot take back the bytes already sent upstream, so the request can only fail.
 //
-// 影响请求头的事实（stream / model）在放行前施加；提交点后才出现的只能写上下文键。
+// Facts that affect the request headers (stream / model) are applied before release; those that appear later can only become context keys.
 func onHttpStreamingRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, chunk []byte, isLastChunk bool) ([]byte, types.Action) {
 	st, _ := ctx.GetContext(ctxKeyXformState).(*xformState)
 	if st == nil {
@@ -380,8 +380,8 @@ func onHttpStreamingRequestBody(ctx wrapper.HttpContext, pluginConfig config.Plu
 
 const ctxKeyXformState = "aip_xform_state"
 
-// 流式路径的运行指标。回落率是上线后必须盯的量：回落走的是全量缓冲，容量按最坏情况配置直到它接近零。
-// 指标只是观测手段：宿主不支持（测试模拟器、或禁用了 metrics 的部署）时静默关闭，绝不能影响请求。
+// Runtime metrics of the streaming path. The fallback rate must be watched after rollout: a fallback means full buffering, sized for the worst case until the rate is near zero.
+// Metrics are observation only: when the host does not support them (the test emulator, or a deployment with metrics disabled) they switch off silently and never affect the request.
 var (
 	streamXformCounters   = map[string]proxywasm.MetricCounter{}
 	streamXformMetricsOff bool
@@ -428,7 +428,7 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 	x.apiName, _ = ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
 	plan, why := pc.NewStreamPlan(ctx, x.apiName, cfg.GetProvider())
 	if plan == nil {
-		log.Debugf("[stream-xform] 不走流式: %s", why)
+		log.Debugf("[stream-xform] not streaming: %s", why)
 		streamXformCount("skipped")
 		return fallbackOnly()
 	}
@@ -453,16 +453,16 @@ func (x *xformState) feed(chunk []byte, last bool) ([]byte, types.Action) {
 	return x.st.Feed(chunk, last)
 }
 
-// onCommit：首次放行请求头之前。请求路径依赖的字段（model / stream）在提交点前没出现就回落——
-// 这是"有界前瞻，超出窗口只能回落"的落点；整份 body 都到了还没见到 stream 就是 false，不必回落。
+// onCommit: before the headers are released for the first time. Fields the request path depends on (model / stream) that did not
+// appear before the commit point mean fallback, where "bounded lookahead, fall back past the window" lands; stream not seen by the end of the body is false, no fallback needed.
 func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
 	if x.plan.Passthrough {
-		// 官方对 body 一个字节都不动：首块前把上下文里的原始头信息写回（官方 defer 里做的事）
+		// the buffered path does not touch the body: before the first chunk write back the original header info from the context (what its defer does)
 		saveContextsToHeaders(x.ctx)
 		return true
 	}
 	if (x.plan.RequireModelBeforeCommit && !pre.ModelSeen) || (x.plan.RequireStreamBeforeCommit && !pre.StreamSeen && !last) {
-		log.Warnf("[stream-xform] 提交点前未见请求路径所需的字段，回落到官方全量路径")
+		log.Warnf("[stream-xform] fields required by the request path not seen before the commit point, falling back to the buffered path")
 		return false
 	}
 	x.cfg.GetProviderConfig().StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, true)
@@ -485,7 +485,7 @@ func (x *xformState) onFinish(pre streamxform.Prelude) {
 	}
 }
 
-// fallback：官方全量路径。
+// fallback is the buffered path.
 func (x *xformState) fallback(body []byte) types.Action {
 	return onHttpRequestBody(x.ctx, x.cfg, body)
 }

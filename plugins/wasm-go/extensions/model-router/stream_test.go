@@ -11,7 +11,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// 流式路径的集成测试：按块喂 body，对照官方语义（gjson 取首个 model、sjson 原地改写、请求头）。
+// Integration tests of the streaming path: the body is fed chunk by chunk and compared with the buffered semantics (gjson takes the first model, sjson rewrites in place, request headers).
 
 func streamHeaders(ct string) [][2]string {
 	return [][2]string{{":authority", "example.com"}, {":path", "/v1/chat/completions"}, {":method", "POST"}, {"Content-Type", ct}, {"Content-Length", "1"}}
@@ -51,7 +51,7 @@ func TestStream_ModelFirstBigBody(t *testing.T) {
 		require.Equal(t, types.HeaderStopIteration, host.CallOnHttpRequestHeaders(streamHeaders("application/json")))
 		body := []byte(`{"model" : "openai/gpt-4o" ,"messages":[{"role":"user","content":"` + bigContent(300<<10) + `"}]}` + "\n")
 		acts, up := feedStream(host, body, 4096)
-		require.Equal(t, types.ActionPause, acts[0], "提交点前应 Pause")
+		require.Equal(t, types.ActionPause, acts[0], "should Pause before the commit point")
 		require.Equal(t, types.ActionContinue, acts[len(acts)-1])
 		nContinue := 0
 		for _, a := range acts {
@@ -59,9 +59,9 @@ func TestStream_ModelFirstBigBody(t *testing.T) {
 				nContinue++
 			}
 		}
-		require.Greater(t, nContinue, len(acts)/2, "提交点后应逐块 Continue")
+		require.Greater(t, nContinue, len(acts)/2, "should Continue chunk by chunk after the commit point")
 		want, _ := sjson.SetBytes(body, "model", "gpt-4o")
-		require.Equal(t, string(want), string(up), "上游 body 应与 sjson 原地改写逐字节一致")
+		require.Equal(t, string(want), string(up), "the upstream body should be byte-identical to sjson's in-place rewrite")
 		require.Equal(t, "openai/gpt-4o", header(host, "x-model"))
 		require.Equal(t, "openai", header(host, "x-provider"))
 	})
@@ -76,7 +76,7 @@ func TestStream_SdkOrderBeyondWindowFallsBack(t *testing.T) {
 		body := []byte(`{"messages":[{"role":"user","content":"` + bigContent(300<<10) + `"}],"model":"openai/gpt-4o"}`)
 		acts, up := feedStream(host, body, 4096)
 		for _, a := range acts[:len(acts)-1] {
-			require.Equal(t, types.ActionPause, a, "model 在窗口之外：应一直 Pause 到末块再走官方路径")
+			require.Equal(t, types.ActionPause, a, "model beyond the window: should Pause until the last chunk, then take the buffered path")
 		}
 		require.Equal(t, types.ActionContinue, acts[len(acts)-1])
 		want, _ := sjson.SetBytes(body, "model", "gpt-4o")
@@ -129,7 +129,7 @@ func TestStream_InvalidJsonFallsBack(t *testing.T) {
 		require.Equal(t, types.HeaderStopIteration, host.CallOnHttpRequestHeaders(streamHeaders("application/json")))
 		body := []byte(`{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":tru}`)
 		_, up := feedStream(host, body, 5)
-		require.Equal(t, string(body), string(up), "官方对非法 JSON 整体不动")
+		require.Equal(t, string(body), string(up), "the buffered path leaves invalid JSON untouched")
 		require.Equal(t, "", header(host, "x-provider"))
 	})
 }
@@ -143,7 +143,7 @@ func TestStream_KeepOriginalAndModelToHeaderOnly(t *testing.T) {
 		require.Equal(t, types.HeaderStopIteration, host.CallOnHttpRequestHeaders(streamHeaders("application/json")))
 		body := []byte(`{"model":"openai/gpt-4o","messages":[{"role":"user","content":"` + bigContent(200<<10) + `"}]}`)
 		_, up := feedStream(host, body, 4096)
-		require.Equal(t, string(body), string(up), "keepOriginalModelName：body 不动")
+		require.Equal(t, string(body), string(up), "keepOriginalModelName: body untouched")
 		require.Equal(t, "openai/gpt-4o", header(host, "x-model"))
 		require.Equal(t, "openai", header(host, "x-provider"))
 	})
@@ -158,7 +158,7 @@ func TestStream_NoModel(t *testing.T) {
 		body := []byte(`{"messages":[{"role":"user","content":"` + bigContent(200<<10) + `"}]}`)
 		acts, up := feedStream(host, body, 4096)
 		for _, a := range acts[:len(acts)-1] {
-			require.Equal(t, types.ActionPause, a, "窗口内没见到 model：回落官方")
+			require.Equal(t, types.ActionPause, a, "model not seen inside the window: fall back to the buffered path")
 		}
 		require.Equal(t, string(body), string(up))
 		require.Equal(t, "", header(host, "x-model"))

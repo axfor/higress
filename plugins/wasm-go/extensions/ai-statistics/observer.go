@@ -13,21 +13,21 @@ import (
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform/guard"
 )
 
-// 请求体流式观察。
+// Streaming observation of the request body.
 //
-// 官方实现总是把整份请求体缓冲下来，只为取顶层 model 和数 user 轮数（messages[].role == "user"，
-// Gemini 则数 contents[] 里 role 缺失或为 user 的元素）。轻量模式（属性里没有 request_body 来源）下
-// 这些都能边扫边算：请求体原样逐块转发，一个字节不缓冲；只有配置了从请求体提取属性
-// （默认属性集的 messages / question / system，或自定义 request_body 属性）时才保留官方缓冲路径。
+// The buffered implementation always collects the whole request body just to read the top-level model and count user turns
+// (messages[].role == "user", or for Gemini the contents[] elements whose role is missing or user). In lightweight mode (no
+// request_body attribute source) all of that can be computed while scanning: the body is forwarded chunk by chunk without
+// buffering a byte; the buffered path stays only when attributes are extracted from the request body (messages / question / system of the default set, or custom request_body attributes).
 //
-// 观察语义对齐 gjson：顶层同名 key 取第一个；messages 是数组就用它（哪怕为空），否则才看 contents；
-// 元素不是对象、role 不是字符串都不计数。请求体不是合法 JSON 时停止观察、继续原样转发。
+// Observation follows gjson semantics: the first of duplicate top-level keys wins; messages is used when it is an array (even empty),
+// contents only otherwise; non-object elements and non-string roles are not counted. When the body is not valid JSON observation stops and forwarding continues verbatim.
 
 const ctxKeyObserver = "ai_statistics_observer"
 
 var observeMetric = guard.NewMetric("ai_statistics.stream")
 
-// requestObserver 是只读协议：Capture 小字段、Skip 其余，输出被丢弃。
+// requestObserver is a read-only protocol: Capture the small fields, Skip the rest, the output is discarded.
 type requestObserver struct {
 	streamxform.BaseProtocol
 	seen         map[string]bool
@@ -39,13 +39,13 @@ type requestObserver struct {
 	userConts    int
 	elemRole     string
 	elemRoleSeen bool
-	inKey        string // 当前在哪个顶层数组里（messages / contents）
+	inKey        string // which top-level array we are in (messages / contents)
 }
 
 func newRequestObserver() *streamxform.Transformer {
 	p := &requestObserver{seen: map[string]bool{}}
 	tr := streamxform.NewTransformer(p)
-	tr.DupKeyBail = false // gjson 取第一个：重复 key 原样跳过即可
+	tr.DupKeyBail = false // gjson takes the first: duplicate keys are simply skipped
 	return tr
 }
 
@@ -83,7 +83,7 @@ func (p *requestObserver) OnStart(t *streamxform.Transformer, kind streamxform.V
 	switch t.Depth() {
 	case 1: // messages / contents
 		if kind != streamxform.KindArray {
-			return streamxform.Skip() // 官方 IsArray() 为假：不用它
+			return streamxform.Skip() // buffered IsArray() is false: not used
 		}
 		p.inKey = t.Last()
 		if p.inKey == "messages" {
@@ -92,18 +92,18 @@ func (p *requestObserver) OnStart(t *streamxform.Transformer, kind streamxform.V
 			p.contsIsArray = true
 		}
 		return streamxform.Enter().Lazy()
-	case 2: // 元素
+	case 2: // element
 		if kind != streamxform.KindObject {
 			if p.inKey == "contents" {
-				p.userConts++ // gjson：非对象元素没有 role → Gemini 规则算作 user
+				p.userConts++ // gjson: a non-object element has no role → counts as user under the Gemini rule
 			}
-			return streamxform.Skip() // messages：非对象元素的 role 为空，不计数
+			return streamxform.Skip() // messages: a non-object element has an empty role, not counted
 		}
 		p.elemRole, p.elemRoleSeen = "", false
 		return streamxform.Enter().Lazy()
 	case 3: // role
 		if kind != streamxform.KindString {
-			p.elemRoleSeen = true // 非字符串：官方 String() 不等于 "user"；Gemini 视为"有 role 但不是 user"
+			p.elemRoleSeen = true // non-string: buffered String() is not "user"; Gemini treats it as "has a role but not user"
 			p.elemRole = "\x00"
 			return streamxform.Skip()
 		}
@@ -122,7 +122,7 @@ func (p *requestObserver) OnValue(t *streamxform.Transformer, raw []byte) {
 		} else if string(raw) == "null" {
 			p.model = ""
 		} else {
-			p.model = string(raw) // gjson 的 String()：数字 / 布尔 / 容器给原文
+			p.model = string(raw) // gjson String(): numbers / booleans / containers give the raw text
 		}
 	case 3: // role
 		var s string
@@ -151,7 +151,7 @@ func (p *requestObserver) OnLeave(t *streamxform.Transformer) {
 	}
 }
 
-// rounds 复刻官方的轮数规则：messages 是数组就用它，否则看 contents。
+// rounds reproduces the buffered turn rule: messages when it is an array, contents otherwise.
 func (p *requestObserver) rounds() int {
 	if p.msgsIsArray {
 		return p.userMsgs
@@ -162,7 +162,7 @@ func (p *requestObserver) rounds() int {
 	return 0
 }
 
-// requestStreamable：轻量模式（没有任何属性从请求体提取）才走流式观察。
+// requestStreamable: only lightweight mode (no attribute extracted from the request body) uses streaming observation.
 func requestStreamable(config AIStatisticsConfig) bool { return !config.shouldBufferRequestBody }
 
 func onHttpStreamingRequestBody(ctx wrapper.HttpContext, config AIStatisticsConfig, chunk []byte, last bool) ([]byte, types.Action) {
@@ -191,7 +191,7 @@ func onHttpStreamingRequestBody(ctx wrapper.HttpContext, config AIStatisticsConf
 	return st.Feed(chunk, last)
 }
 
-// finishRequestBody 是官方 onHttpRequestBody 取到 model 与轮数之后的收尾，两条路径共用。
+// finishRequestBody is the tail of the buffered onHttpRequestBody after model and turns are known, shared by both paths.
 func finishRequestBody(ctx wrapper.HttpContext, requestModel string, userPromptCount int) {
 	// If model not found in body, try to extract from path (Gemini style)
 	if requestModel == "UNKNOWN" {

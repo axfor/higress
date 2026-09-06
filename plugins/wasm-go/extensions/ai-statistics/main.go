@@ -705,7 +705,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AIStatisticsConfig) ty
 	// This is essential for metrics and logging
 	ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
 	if !requestStreamable(config) {
-		ctx.BufferRequestBody() // 要从请求体提取属性：官方全量路径（见 observer.go）
+		ctx.BufferRequestBody() // attributes are extracted from the request body: buffered path (see observer.go)
 	}
 
 	// Extract session ID from headers

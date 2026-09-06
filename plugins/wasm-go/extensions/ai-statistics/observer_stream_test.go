@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 流式观察的集成测试：轻量模式下逐块 Continue、body 原样转发、model 与轮数写入上下文；
-// 默认属性集（要从请求体提取 messages 等）保持官方缓冲路径。
+// Integration tests of streaming observation: in lightweight mode every chunk Continues, the body is forwarded verbatim, model and turns are written to the context;
+// the default attribute set (which extracts messages etc. from the request body) keeps the buffered path.
 
 func statHeaders() [][2]string {
 	return [][2]string{{":authority", "example.com"}, {":path", "/v1/chat/completions"}, {":method", "POST"}, {"Content-Type", "application/json"}, {"Content-Length", "1"}}
@@ -31,10 +31,10 @@ func TestStreamObserve_Lightweight(t *testing.T) {
 			if j > len(body) {
 				j = len(body)
 			}
-			require.Equal(t, types.ActionContinue, host.CallOnHttpStreamingRequestBody(body[i:j], j == len(body)), "观察形态永远 Continue")
+			require.Equal(t, types.ActionContinue, host.CallOnHttpStreamingRequestBody(body[i:j], j == len(body)), "observe mode always Continues")
 			upstream = append(upstream, host.GetRequestBody()...)
 		}
-		require.Equal(t, string(body), string(upstream), "请求体原样转发")
+		require.Equal(t, string(body), string(upstream), "the request body is forwarded verbatim")
 		attrs := getAILogAttributes(t, host)
 		round, ok := aiLogInt64(attrs, ChatRound)
 		require.True(t, ok)
@@ -52,7 +52,7 @@ func TestStreamObserve_DefaultAttributesKeepBuffering(t *testing.T) {
 		require.Equal(t, types.OnPluginStartStatusOK, status)
 		host.CallOnHttpRequestHeaders(statHeaders())
 		body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
-		// 官方路径：整份 body 一次交付
+		// buffered path: the whole body delivered at once
 		require.Equal(t, types.ActionContinue, host.CallOnHttpRequestBody(body))
 		attrs := getAILogAttributes(t, host)
 		round, ok := aiLogInt64(attrs, ChatRound)

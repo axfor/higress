@@ -5,47 +5,47 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 )
 
-// 流式请求体转换的接入点。
+// Entry points of streaming request body transformation.
 //
-// 这里回答两个问题：(1) 这个 provider + apiName + 配置能不能走流式；(2) 走流式时，
-// 官方全量路径里那些"顺手做掉"的副作用（改请求头、写上下文键）由谁来补。
-// 判定条件全部对照 handleRequestBody / defaultTransformRequestBody 逐行推导，
-// 任何一条官方会额外动 body 的配置都直接判不适用——回落到官方路径，而不是猜。
+// Two questions are answered here: (1) can this provider + apiName + configuration stream; (2) when it does, who applies
+// the side effects the buffered path does "on the way" (request headers, context keys).
+// Every condition is derived line by line from handleRequestBody / defaultTransformRequestBody; any setting under which
+// the buffered path would touch the body further is declared not applicable and falls back to that path instead of guessing.
 
-// StreamPlan 是一个请求的流式方案。
+// StreamPlan is the streaming plan of one request.
 type StreamPlan struct {
 	Tr *streamxform.Transformer
-	// Passthrough：官方对 body 一个字节都不动（generic），直接逐块放行，不经转换器。
+	// Passthrough: the buffered path does not touch the body at all (generic); chunks are released directly without a transformer.
 	Passthrough bool
-	// ApplyStream：官方路径会依据 stream 改 Accept 头并写 isStreaming
-	// （默认路径的 chat / videos / videoremix 为真；Qwen 兼容模式与非流式接口为假）。
+	// ApplyStream: the buffered path sets the Accept header and isStreaming according to stream
+	// (true for chat / videos / videoremix on the default path; false in Qwen compatible mode and for non-streaming endpoints).
 	ApplyStream bool
-	// ApplyModel：官方路径会写 originalRequestModel / finalRequestModel 上下文键。
+	// ApplyModel: the buffered path writes the originalRequestModel / finalRequestModel context keys.
 	ApplyModel bool
-	// NoAcceptHeader：官方路径虽然调了 parseRequestAndMapModel，但随后用 body 阶段开始时的
-	// 请求头快照整体覆盖（ReplaceRequestHeaders），Accept 的改写实际不生效——Gemini 就是这样。
+	// NoAcceptHeader: the buffered path calls parseRequestAndMapModel but then overwrites the headers with the snapshot taken
+	// at the start of the body phase (ReplaceRequestHeaders), so the Accept rewrite never takes effect; Gemini works this way.
 	NoAcceptHeader bool
-	// RequireModelBeforeCommit：放行请求头之前必须已经见到 model（请求路径依赖它）。
-	// 提交点到了还没见到就回落——这是"有界前瞻，超出窗口只能回落"的落点。
+	// RequireModelBeforeCommit: model must have been seen before the request headers are released (the request path depends on it).
+	// Not seen by the commit point means fallback; this is where "bounded lookahead, fall back past the window" lands.
 	RequireModelBeforeCommit bool
-	// RequireStreamBeforeCommit：同上，请求路径依赖 stream（Gemini 的 generateContent / streamGenerateContent）。
-	// 整份 body 都到了还没见到则视为 false，与官方一致。
+	// RequireStreamBeforeCommit: likewise for stream (Gemini's generateContent / streamGenerateContent).
+	// Not seen by the end of the body counts as false, as on the buffered path.
 	RequireStreamBeforeCommit bool
-	// AfterPrelude 在上下文键写好、请求头放行之前调用：用于依赖 body 事实改请求头（Azure 路径）。
+	// AfterPrelude is called after the context keys are written and before the headers are released: header changes that depend on body facts (the Azure path).
 	AfterPrelude func(ctx wrapper.HttpContext)
-	// OnFinish 在整份 body 扫完后调用：写只有到末尾才能确定、且只有响应侧才用的上下文键。
+	// OnFinish is called after the whole body has been scanned: context keys that are only known at the end and only used on the response side.
 	OnFinish func(ctx wrapper.HttpContext)
 }
 
-// streamDefaultProviders 走 defaultTransformRequestBody 的 provider
-// （无 TransformRequestBody*，或有但只是转调默认实现）。
+// streamDefaultProviders are the providers that go through defaultTransformRequestBody
+// (no TransformRequestBody*, or one that only delegates to the default implementation).
 var streamDefaultProviders = map[string]bool{
 	providerTypeAi360: true, providerTypeBaichuan: true, providerTypeBaidu: true,
 	providerTypeCloudflare: true, providerTypeDeepSeek: true, providerTypeFireworks: true,
@@ -53,33 +53,33 @@ var streamDefaultProviders = map[string]bool{
 	providerTypeGroq: true, providerTypeMistral: true, providerTypeMoonshot: true,
 	providerTypeOllama: true, providerTypeSpark: true, providerTypeStepfun: true,
 	providerTypeTogetherAI: true, providerTypeYi: true,
-	providerTypeVllm: true, // TransformRequestBody 只转调默认实现
+	providerTypeVllm: true, // TransformRequestBody only delegates to the default implementation
 }
 
-// NewStreamPlan 为一个请求挑选流式协议。返回 nil 时 why 说明原因，调用方走官方全量路径。
+// NewStreamPlan picks the streaming protocol for one request. A nil plan comes with why; the caller takes the buffered path.
 func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName, prov Provider) (plan *StreamPlan, why string) {
 	if c.typ == providerTypeGeneric {
-		// generic 的 OnRequestBody 只是把 body 原样写回，不经 handleRequestBody：
-		// 只有 main.go 里对所有 provider 生效的两项配置会碰 body / 上下文
+		// generic's OnRequestBody writes the body back unchanged without handleRequestBody:
+		// only the two settings in main.go that apply to every provider touch the body / context
 		if len(c.customSettings) > 0 {
-			return nil, "customSettings 会改写 body"
+			return nil, "customSettings rewrites the body"
 		}
 		if c.IsRetryOnFailureEnabled() {
-			return nil, "retryOnFailure 需要把全量 body 存进上下文"
+			return nil, "retryOnFailure needs the whole body stored in the context"
 		}
 		return &StreamPlan{Passthrough: true}, ""
 	}
 	if c.IsOriginal() {
-		return nil, "original 协议"
+		return nil, "original protocol"
 	}
 	if c.firstByteTimeout != 0 {
-		return nil, "firstByteTimeout 需要在放行请求头前知道 stream，字段位置不可控"
+		return nil, "firstByteTimeout needs stream before the headers are released, and the field position is not under our control"
 	}
 	if len(c.customSettings) > 0 {
-		return nil, "customSettings 会改写 body"
+		return nil, "customSettings rewrites the body"
 	}
 	if c.context != nil {
-		return nil, "context 注入需要全量 body"
+		return nil, "context injection needs the whole body"
 	}
 	if len(c.contextCleanupCommands) > 0 {
 		return nil, "contextCleanupCommands"
@@ -88,22 +88,22 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return nil, "mergeConsecutiveMessages"
 	}
 	if c.IsRetryOnFailureEnabled() {
-		return nil, "retryOnFailure 需要把全量 body 存进上下文"
+		return nil, "retryOnFailure needs the whole body stored in the context"
 	}
 	if need, _ := ctx.GetContext("needClaudeResponseConversion").(bool); need {
-		return nil, "Claude 协议输入的自动转换"
+		return nil, "automatic conversion of Claude protocol input"
 	}
 	if !c.isSupportedAPI(apiName) {
-		return nil, "apiName 不受支持"
+		return nil, "apiName not supported"
 	}
 	if !c.needToProcessRequestBody(apiName) {
-		return nil, "该 apiName 官方不处理请求体"
+		return nil, "the buffered path does not handle the request body for this apiName"
 	}
 	if ct, _ := proxywasm.GetHttpRequestHeader("content-type"); !strings.Contains(ct, "application/json") {
-		return nil, "非 JSON 请求体（multipart 等）走官方路径"
+		return nil, "non-JSON request body (multipart etc.) takes the buffered path"
 	}
 	isChat := apiName == ApiNameChatCompletion
-	// defaultTransformRequestBody 只对这三类接口读 stream
+	// defaultTransformRequestBody reads stream only for these three endpoint kinds
 	detectStream := isChat || apiName == ApiNameVideos || apiName == ApiNameVideoRemix
 	mapLenient := func(m string) string { return getMappedModel(m, c.modelMapping) }
 	normalize := c.IsOpenAIProtocol() && !c.IsGeneric() && (isChat || apiName == ApiNameCompletion) && !c.disableStreamUsageStats
@@ -120,7 +120,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	defaultPlan := func(v streamxform.OpenAIVariant) *StreamPlan {
 		return &StreamPlan{Tr: streamxform.NewOpenAI(defaultOpts(v)), ApplyStream: detectStream, ApplyModel: true}
 	}
-	// 走默认路径的 provider 里，这几类接口官方另有处理
+	// among the providers on the default path, these endpoint kinds are handled separately by the buffered path
 	inDefaultApis := true
 	if c.typ == providerTypeDoubao && (apiName == ApiNameResponses || apiName == ApiNameImageGeneration) {
 		inDefaultApis = false
@@ -128,7 +128,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 
 	switch {
 	case c.typ == providerTypeClaude && !isChat:
-		// /v1/messages（原生 Claude 协议）、/v1/complete、embeddings：官方走 defaultTransformRequestBody
+		// /v1/messages (native Claude protocol), /v1/complete, embeddings: the buffered path uses defaultTransformRequestBody
 		return defaultPlan(nil), ""
 
 	case c.typ == providerTypeClaude:
@@ -147,15 +147,15 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}), ApplyStream: true, ApplyModel: true}, ""
 
 	case c.typ == providerTypeQwen && !c.qwenEnableCompatible:
-		// DashScope 原生协议：官方 onChatCompletionRequestBody 在 body 阶段按 model / stream 改路径与请求头
+		// native DashScope protocol: the buffered onChatCompletionRequestBody changes the path and headers by model / stream in the body phase
 		if !isChat {
-			return nil, "qwen 原生协议仅 chat completion 走流式"
+			return nil, "native qwen protocol streams chat completion only"
 		}
 		if c.providerBasePath != "" {
-			return nil, "providerBasePath 需要在 body 阶段改 :path"
+			return nil, "providerBasePath needs :path changed in the body phase"
 		}
 		if len(c.qwenFileIds) > 0 {
-			return nil, "qwenFileIds 要往 messages 里插入文件消息"
+			return nil, "qwenFileIds inserts file messages into messages"
 		}
 		mapStrict := func(m string) (string, error) {
 			if m == "" {
@@ -177,7 +177,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
 		p.AfterPrelude = func(ctx wrapper.HttpContext) {
-			// 复刻 onChatCompletionRequestBody 对请求头 / 路径的处理
+			// reproduce the header / path handling of onChatCompletionRequestBody
 			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
 			if strings.HasPrefix(model, qwenVlModelPrefixName) {
 				_ = util.OverwriteRequestPath(qwenMultimodalGenerationPath)
@@ -201,33 +201,33 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 
 	case c.typ == providerTypeQwen:
 		if c.providerBasePath != "" {
-			return nil, "providerBasePath 需要在 body 阶段改 :path"
+			return nil, "providerBasePath needs :path changed in the body phase"
 		}
 		if !inDefaultApis {
-			return nil, "该 apiName 未纳入流式"
+			return nil, "this apiName is not covered by streaming"
 		}
 		opts := defaultOpts(&streamxform.QwenVariant{SupportsPreserveThinking: qwenSupportsPreserveThinking})
 		opts.ModelOnlyIfPresent = true
-		opts.DetectStream = false // 兼容分支不调 defaultTransformRequestBody，不设 Accept / isStreaming
+		opts.DetectStream = false // the compatible branch does not call defaultTransformRequestBody: no Accept / isStreaming
 		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}, ""
 
 	case c.typ == providerTypeMinimax:
-		// V2 接口（默认）：官方 handleRequestBodyByChatCompletionV2 只改 model 并把路径固定为 chatcompletion_v2；
-		// Pro 接口另有一套请求结构，不走流式。
+		// V2 endpoint (default): the buffered handleRequestBodyByChatCompletionV2 only changes model and pins the path to chatcompletion_v2;
+		// the Pro endpoint has a request structure of its own and does not stream.
 		if c.minimaxApiType == minimaxApiTypePro {
-			return nil, "minimax Pro 接口未纳入流式"
+			return nil, "the minimax Pro endpoint is not covered by streaming"
 		}
 		if c.providerBasePath != "" {
-			return nil, "providerBasePath 需要在 body 阶段改 :path"
+			return nil, "providerBasePath needs :path changed in the body phase"
 		}
 		if !isChat {
-			return nil, "minimax 仅 chat completion"
+			return nil, "minimax streams chat completion only"
 		}
 		opts := defaultOpts(nil)
-		opts.DetectStream = false // 官方这条分支不设 Accept / isStreaming，也不写 model 上下文键
+		opts.DetectStream = false // this buffered branch sets neither Accept / isStreaming nor the model context keys
 		p := &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}
 		p.AfterPrelude = func(ctx wrapper.HttpContext) {
-			// 官方在 body 阶段才把路径改成 v2 接口（header 阶段不改）；路径固定，不依赖 body 字段
+			// the buffered path only switches to the v2 endpoint in the body phase (not in the header phase); the path is fixed and independent of body fields
 			if err := util.OverwriteRequestPath(minimaxChatCompletionV2Path); err != nil {
 				log.Errorf("minimaxProvider: overwrite request path failed: %v", err)
 			}
@@ -236,7 +236,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 
 	case c.typ == providerTypeZhipuAi:
 		if !inDefaultApis {
-			return nil, "该 apiName 未纳入流式"
+			return nil, "this apiName is not covered by streaming"
 		}
 		var v streamxform.OpenAIVariant
 		if isChat {
@@ -246,7 +246,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 
 	case c.typ == providerTypeOpenRouter:
 		if !inDefaultApis {
-			return nil, "该 apiName 未纳入流式"
+			return nil, "this apiName is not covered by streaming"
 		}
 		var v streamxform.OpenAIVariant
 		if isChat {
@@ -257,10 +257,10 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	case c.typ == providerTypeGemini:
 		gp, ok := prov.(*geminiProvider)
 		if !ok {
-			return nil, "gemini provider 实例类型异常"
+			return nil, "unexpected gemini provider instance type"
 		}
 		if !isChat {
-			return nil, "gemini 仅 chat completion 走流式"
+			return nil, "gemini streams chat completion only"
 		}
 		var ss []streamxform.GeminiSafetySetting
 		for k, v := range c.geminiSafetySetting {
@@ -283,7 +283,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			ThinkingBudget: c.geminiThinkingBudget,
 			SafetySettings: ss,
 		}), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true}
-		// 官方 onChatCompletionRequestBody：路径 = /{version}/models/{映射后 model}:{generateContent|streamGenerateContent}
+		// buffered onChatCompletionRequestBody: path = /{version}/models/{mapped model}:{generateContent|streamGenerateContent}
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
 		p.AfterPrelude = func(ctx wrapper.HttpContext) {
@@ -298,14 +298,14 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	case c.typ == providerTypeAzure:
 		ap, ok := prov.(*azureProvider)
 		if !ok {
-			return nil, "azure provider 实例类型异常"
+			return nil, "unexpected azure provider instance type"
 		}
 		if !inDefaultApis {
-			return nil, "该 apiName 未纳入流式"
+			return nil, "this apiName is not covered by streaming"
 		}
-		// 官方 TransformRequestBody：默认转换后再按上下文里的最终 model 改写 :path。
-		// serviceUrl 里没有部署名（DomainOnly / OpenAI v1 base）时路径含 {model} 占位，
-		// 必须在放行请求头前知道 model；其余两种形态路径与 body 无关。
+		// buffered TransformRequestBody: after the default transform, :path is rewritten from the final model in the context.
+		// Without a deployment name in serviceUrl (DomainOnly / OpenAI v1 base) the path holds a {model} placeholder and model
+		// must be known before the headers are released; the other two forms have paths independent of the body.
 		p := defaultPlan(nil)
 		p.RequireModelBeforeCommit = !azureModelIrrelevantApis[apiName] &&
 			(ap.serviceUrlType == azureServiceUrlTypeDomainOnly || ap.serviceUrlType == azureServiceUrlTypeOpenAIV1Base)
@@ -320,28 +320,28 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 
 	case c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat || c.typ == providerTypeDoubao || streamDefaultProviders[c.typ]:
 		if (c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat) && c.responseJsonSchema != nil {
-			return nil, "responseJsonSchema 会经 struct 重新序列化"
+			return nil, "responseJsonSchema is re-serialized through a struct"
 		}
 		if !inDefaultApis {
-			return nil, "该 apiName 的默认路径未纳入流式"
+			return nil, "the default path of this apiName is not covered by streaming"
 		}
 		return defaultPlan(nil), ""
 	}
-	return nil, "provider " + c.typ + " 的流式协议尚未实现"
+	return nil, "no streaming protocol implemented for provider " + c.typ
 }
 
-// StreamApplyPrelude 施加官方全量路径里的副作用：
-//   - 请求头 Accept: text/event-stream（仅 stream 为真；只在请求头尚未放行时有效）
-//   - 上下文键 isStreaming / originalRequestModel / finalRequestModel
+// StreamApplyPrelude applies the side effects of the buffered path:
+//   - request header Accept: text/event-stream (only when stream is true; only effective while the headers are still held)
+//   - context keys isStreaming / originalRequestModel / finalRequestModel
 //
-// headersMutable 为 false 说明请求头已经下发（越过提交点后），此时只写上下文键。
+// headersMutable false means the headers have already been sent (past the commit point); only the context keys are written then.
 func (c *ProviderConfig) StreamApplyPrelude(ctx wrapper.HttpContext, apiName ApiName, plan *StreamPlan, pre streamxform.Prelude, headersMutable bool) {
 	if plan.ApplyStream && pre.StreamSeen {
 		if pre.Stream && !plan.NoAcceptHeader {
 			if headersMutable {
 				_ = proxywasm.ReplaceHttpRequestHeader("Accept", "text/event-stream")
 			} else {
-				log.Warnf("[stream-xform] stream=true 在提交点之后才出现，Accept 请求头未改写")
+				log.Warnf("[stream-xform] stream=true appeared after the commit point, Accept header not rewritten")
 			}
 		}
 		ctx.SetContext(ctxKeyIsStreaming, pre.Stream)
@@ -352,8 +352,8 @@ func (c *ProviderConfig) StreamApplyPrelude(ctx wrapper.HttpContext, apiName Api
 	}
 }
 
-// StreamFinalizeContext 在整份 body 扫完后补齐"没见到"的默认值，与官方一致：
-// chat 请求官方总会写 isStreaming（缺省 false）。
+// StreamFinalizeContext fills in the defaults for fields never seen once the whole body is scanned, as the buffered path does:
+// chat requests always get isStreaming written (false by default).
 func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName ApiName, plan *StreamPlan, pre streamxform.Prelude) {
 	if plan.ApplyStream && !pre.StreamSeen {
 		ctx.SetContext(ctxKeyIsStreaming, false)
