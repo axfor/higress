@@ -14,7 +14,7 @@ require (
 )
 
 require (
-	github.com/axfor/ason v0.0.0 // indirect
+	github.com/axfor/ason v0.0.0-20260906113522-b79aae88281d // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
@@ -29,5 +29,3 @@ replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/
 
 // TODO(PR): 依赖 wasm-go 新增的 ProcessStreamingRequestBodyWithAction 与 GC 看门狗，合入后改为版本号
 replace github.com/higress-group/wasm-go => /Users/axx/code/wasm-go
-
-replace github.com/axfor/ason => /Users/axx/ason
