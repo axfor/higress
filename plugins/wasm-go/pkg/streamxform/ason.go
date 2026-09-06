@@ -13,6 +13,22 @@ type (
 	BaseProtocol = ason.BaseProtocol
 	Writer       = ason.Writer
 	DeferredKV   = ason.DeferredKV
+	// Error / Code：判定不支持的详情与分类（tr.Err()）。集成层按 Code 归类回落原因，不匹配文案。
+	Error = ason.Error
+	Code  = ason.Code
+)
+
+const (
+	ErrNone          = ason.ErrNone
+	ErrSyntax        = ason.ErrSyntax
+	ErrIncomplete    = ason.ErrIncomplete
+	ErrRoot          = ason.ErrRoot
+	ErrTrailing      = ason.ErrTrailing
+	ErrDuplicateKey  = ason.ErrDuplicateKey
+	ErrLimit         = ason.ErrLimit
+	ErrLeftoverDefer = ason.ErrLeftoverDefer
+	ErrUnsupported   = ason.ErrUnsupported
+	ErrMisuse        = ason.ErrMisuse
 )
 
 const (
@@ -38,6 +54,7 @@ var (
 	Probe          = ason.Probe
 	Prefix         = ason.Prefix
 	Bail           = ason.Bail
+	BailCode       = ason.BailCode
 )
 
 // 协议实现里用到的通用辅助

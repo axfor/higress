@@ -116,3 +116,54 @@ func TestUncoverableAfterCommit(t *testing.T) {
 		t.Fatalf("提交点后非法字面量应触发 Uncoverable: unc=%q last=%v", unc, acts[len(acts)-1])
 	}
 }
+
+// 指标按引擎的 Error.Code 细分：fallback.<code> / uncoverable.<code> / observe_bailed.<code>，不匹配文案。
+func TestMetricsByCode(t *testing.T) {
+	collect := func() (func(string), *[]string) {
+		var got []string
+		return func(n string) { got = append(got, n) }, &got
+	}
+	// 提交点前文法错误 → fallback.syntax
+	body := []byte(`{"a":1,"b":tru}`)
+	stubHost(t, body)
+	m, got := collect()
+	s := New(&Plan{Tr: streamxform.NewTransformer(streamxform.BaseProtocol{}), Mode: Transform, Metric: m,
+		Fallback: func([]byte) types.Action { return types.ActionContinue }})
+	feedAll(s, body, 4)
+	if strings.Join(*got, ",") != "fallback,fallback.syntax" {
+		t.Fatalf("文法错误的指标: %v", *got)
+	}
+	// 提交点前重复 key → fallback.duplicate_key
+	body = []byte(`{"a":1,"a":2}`)
+	stubHost(t, body)
+	m, got = collect()
+	tr := streamxform.NewTransformer(streamxform.BaseProtocol{})
+	tr.DupKeyBail = true
+	s = New(&Plan{Tr: tr, Mode: Transform, Metric: m, Fallback: func([]byte) types.Action { return types.ActionContinue }})
+	feedAll(s, body, 4)
+	if strings.Join(*got, ",") != "fallback,fallback.duplicate_key" {
+		t.Fatalf("重复 key 的指标: %v", *got)
+	}
+	// 提交点后文法错误 → uncoverable.syntax，Uncoverable 拿到带偏移的原因
+	body = []byte(`{"pad":"` + big(200<<10) + `","b":tru}`)
+	stubHost(t, body)
+	m, got = collect()
+	var why string
+	s = New(&Plan{Tr: streamxform.NewTransformer(streamxform.BaseProtocol{}), Mode: Transform, Metric: m,
+		Uncoverable: func(r string) { why = r }})
+	feedAll(s, body, 4096)
+	if strings.Join(*got, ",") != "streamed,uncoverable,uncoverable.syntax" {
+		t.Fatalf("提交点后的指标: %v", *got)
+	}
+	if !strings.Contains(why, "incomplete literal at byte") {
+		t.Fatalf("Uncoverable 原因应带偏移: %q", why)
+	}
+	// Observe 形态 → observe_bailed.syntax，输入照常转发
+	body = []byte(`{"a":1,"b":tru}`)
+	m, got = collect()
+	s = New(&Plan{Tr: streamxform.NewTransformer(streamxform.BaseProtocol{}), Mode: Observe, Metric: m})
+	out, _ := feedAll(s, body, 4)
+	if string(out) != string(body) || strings.Join(*got, ",") != "streamed,observe_bailed,observe_bailed.syntax" {
+		t.Fatalf("观察形态: out=%q metrics=%v", out, *got)
+	}
+}

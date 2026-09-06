@@ -141,7 +141,7 @@ func TestQwenNativeFuzz(t *testing.T) {
 			continue
 		}
 		if !sok {
-			if strings.Contains(why, "重复的 key") || strings.Contains(why, "panic") {
+			if strings.Contains(why, "duplicate key") || strings.Contains(why, "panic") {
 				fb++
 				continue
 			}

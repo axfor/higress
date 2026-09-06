@@ -87,6 +87,21 @@ func (s *State) metric(name string) {
 	}
 }
 
+// bailed 记一次判定不支持：总计数 + 按分类的计数（fallback.duplicate_key、uncoverable.limit……）。
+// 分类来自引擎的 Error.Code，不匹配文案；非引擎原因（OnCommit 要求回落）用调用方给的名字。
+func (s *State) bailed(kind, code string) {
+	s.metric(kind)
+	s.metric(kind + "." + code)
+}
+
+// codeOf 取转换器判定不支持的分类名。
+func codeOf(tr *streamxform.Transformer) string {
+	if tr == nil || tr.Err() == nil {
+		return "none"
+	}
+	return tr.Err().Code.String()
+}
+
 func (s *State) logf(format string, args ...interface{}) {
 	if s.plan.Log != nil {
 		s.plan.Log(format, args...)
@@ -102,7 +117,7 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	if s.plan.Passthrough || s.raw {
 		if !s.sent {
 			if s.plan.OnCommit != nil && !s.plan.OnCommit(Prelude(s.plan.Tr), last) {
-				return s.toFallback(last, "OnCommit 要求回落")
+				return s.toFallback(last, "OnCommit 要求回落", "oncommit")
 			}
 			s.sent = true
 			s.metric("streamed")
@@ -122,8 +137,9 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 			tr.Out() // 观察形态的输出没人要，取走以免积累
 			if bad, why := tr.Unsupported(); bad {
 				s.dead = true
-				s.metric("observe_bailed")
-				s.logf("[streamxform] 停止观察: %s (received=%d)", why, s.total)
+				code := codeOf(tr)
+				s.bailed("observe_bailed", code)
+				s.logf("[streamxform] 停止观察 (%s): %s (received=%d)", code, why, s.total)
 			}
 		}
 		if !s.sent {
@@ -144,10 +160,11 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		fin = tr.Finish() // Finish 把缓冲里剩余的输出一并取走，下面不能再指望 Out()
 	}
 	if bad, why := tr.Unsupported(); bad {
+		code := codeOf(tr)
 		if tr.Committed() && s.sent {
 			// 已越过提交点：部分字节已发给上游，无法回落，只能失败。
-			s.logf("[streamxform] 提交点之后判定不支持，请求失败: %s", why)
-			s.metric("uncoverable")
+			s.logf("[streamxform] 提交点之后判定不支持 (%s)，请求失败: %s", code, why)
+			s.bailed("uncoverable", code)
 			if s.plan.Uncoverable != nil {
 				s.plan.Uncoverable(why)
 			} else {
@@ -155,14 +172,14 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 			}
 			return nil, types.ActionPause
 		}
-		return s.toFallback(last, why)
+		return s.toFallback(last, why, code)
 	}
 	if !tr.Committed() {
 		return nil, types.ActionPause // 提交点之前：留在宿主缓冲区，继续攒
 	}
 	if !s.sent {
 		if s.plan.OnCommit != nil && !s.plan.OnCommit(Prelude(tr), last) {
-			return s.toFallback(last, "提交点前未满足放行条件")
+			return s.toFallback(last, "提交点前未满足放行条件", "oncommit")
 		}
 		s.sent = true
 		s.metric("streamed")
@@ -179,9 +196,9 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	return out, types.ActionContinue
 }
 
-func (s *State) toFallback(last bool, why string) ([]byte, types.Action) {
-	s.logf("[streamxform] 回落到官方全量路径: %s (received=%d last=%v)", why, s.total, last)
-	s.metric("fallback")
+func (s *State) toFallback(last bool, why, code string) ([]byte, types.Action) {
+	s.logf("[streamxform] 回落到官方全量路径 (%s): %s (received=%d last=%v)", code, why, s.total, last)
+	s.bailed("fallback", code)
 	s.fallback = true
 	s.plan.Tr = nil
 	return s.feedFallback(last)

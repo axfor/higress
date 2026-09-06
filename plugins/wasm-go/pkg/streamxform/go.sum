@@ -1,5 +1,7 @@
 github.com/axfor/ason v0.0.0-20260906113522-b79aae88281d h1:FDieF6BFj2XP+mY/EBgbTrvtdmMIpJ/RjgSA7ecM2ns=
 github.com/axfor/ason v0.0.0-20260906113522-b79aae88281d/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
+github.com/axfor/ason v0.0.0-20260906141048-38e1a2861ffa h1:flsJDlbFrIDXOquCn3gdurC2eVQ/sRdUI34nocGtPb4=
+github.com/axfor/ason v0.0.0-20260906141048-38e1a2861ffa/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2 h1:NY33OrWCJJ+DFiLc+lsBY4Ywor2Ik61ssk6qkGF8Ypo=

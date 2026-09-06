@@ -652,7 +652,7 @@ func TestFuzzDifferential(t *testing.T) {
 		}
 		if !sok {
 			fallback++
-			if !strings.Contains(why, "重复的 key") && !strings.Contains(why, "官方会跳过") && !strings.Contains(why, "panic") {
+			if !strings.Contains(why, "duplicate key") && !strings.Contains(why, "官方会跳过") && !strings.Contains(why, "panic") {
 				t.Fatalf("第 %d 例意外回落 (chunk=%d): %s\n  输入: %s", i, chunk, why, in)
 			}
 			continue
@@ -1079,7 +1079,7 @@ func TestVariantsFuzz(t *testing.T) {
 			chunk := []int{1, 3, 17, 64, 4096}[r.Intn(5)]
 			str, sok, why := runStream(vc.stream(chat), in, chunk)
 			if !sok {
-				if chat && hasDeveloper(in) || strings.Contains(why, "不是对象") || strings.Contains(why, "messages 不是数组") || strings.Contains(why, "重复 key") {
+				if chat && hasDeveloper(in) || strings.Contains(why, "不是对象") || strings.Contains(why, "messages 不是数组") || strings.Contains(why, "重复 key") || strings.Contains(why, "duplicate key") {
 					fb++
 					continue
 				}

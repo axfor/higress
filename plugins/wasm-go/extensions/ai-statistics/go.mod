@@ -13,7 +13,7 @@ require (
 )
 
 require (
-	github.com/axfor/ason v0.0.0-20260906113522-b79aae88281d // indirect
+	github.com/axfor/ason v0.0.0-20260906141048-38e1a2861ffa // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
