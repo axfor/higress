@@ -43,6 +43,10 @@ const (
 	CommitBytes = ason.CommitBytes
 )
 
+// OutBufferSize is the scratch buffer each wasm VM keeps for building output: one commit window plus a
+// generous chunk. Sized once per VM, never per request.
+const OutBufferSize = 128 << 10
+
 var (
 	NewTransformer = ason.NewTransformer
 	Pass           = ason.Pass

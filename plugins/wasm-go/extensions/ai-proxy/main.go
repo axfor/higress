@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/config"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
@@ -117,6 +118,7 @@ func init() {
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
 		wrapper.ProcessResponseBody(onHttpResponseBody),
+		wrapper.ProcessStreamDone(onStreamDone),
 		wrapper.WithRebuildMaxMemBytes[config.PluginConfig](200*1024*1024),
 	)
 }
@@ -380,6 +382,84 @@ func onHttpStreamingRequestBody(ctx wrapper.HttpContext, pluginConfig config.Plu
 
 const ctxKeyXformState = "aip_xform_state"
 
+// Admission control for the streaming path.
+//
+// Buffering the whole body has a side effect the streaming path loses: it caps how many requests are being
+// uploaded to the upstream at the same time. Without that cap, thousands of concurrent uploads starve each
+// other and throughput collapses (measured: the same collapse happens with no wasm filter at all, so it is a
+// property of the data path, not of this plugin). Streaming therefore has to state the bound itself: past the
+// current limit, new requests take the buffered path, which is exactly how the plugin behaved before.
+//
+// The limit is a fixed number of in-flight streaming uploads per wasm VM (per Envoy worker). An adaptive
+// version is kept behind admAdaptive: every completed streaming request reports how long it took, the
+// shortest time ever seen (with slow decay, so the baseline follows the upstream) is the reference, and the
+// limit grows additively while requests finish quickly and is cut multiplicatively once they queue. It is off
+// by default: on the lab gateway it walked the limit up to admMax, and 1MB bodies at 400 concurrency then
+// showed a 1.6x larger Envoy heap (315-370MB of tcmalloc against 199-204MB) and a p99 of 37-42s against 15-18s,
+// with no throughput to show for it. Turn it on only with that heap and tail latency under watch.
+const (
+	admLatencyOK  = 2  // finished within baseline x2: there is headroom, raise the limit by one
+	admLatencyBad = 4  // took longer than baseline x4: requests are queueing, cut the limit to 0.9x
+	admDecayEvery = 64 // every this many completions, relax the baseline by 1/8 so one freak minimum cannot pin it
+)
+
+var (
+	streamInflight int
+	admLimit       = 500.0 // current limit, in in-flight streaming uploads per wasm VM
+	admMin         = 50.0
+	admMax         = 4000.0
+	admAdaptive    = false // see above: adaptive costs Envoy heap and tail latency without buying throughput
+	admBaseline    int64   // shortest completion time observed, in nanoseconds
+	admDone        int
+)
+
+// admOnDone folds one request's completion time into the baseline, and into the limit when adaptive is on.
+func admOnDone(dur int64) {
+	if dur <= 0 {
+		return
+	}
+	if admBaseline == 0 || dur < admBaseline {
+		admBaseline = dur
+	}
+	admDone++
+	if admDone%admDecayEvery == 0 {
+		admBaseline += admBaseline / 8 // relax slowly so the baseline follows the real upstream
+	}
+	if !admAdaptive {
+		return
+	}
+	switch {
+	case dur <= admBaseline*admLatencyOK:
+		if admLimit < admMax {
+			admLimit++
+		}
+	case dur > admBaseline*admLatencyBad:
+		admLimit *= 0.9
+		if admLimit < admMin {
+			admLimit = admMin
+		}
+	}
+}
+
+const (
+	ctxKeyAdmitted   = "aip_xform_admitted"
+	ctxKeyAdmitStart = "aip_xform_admit_start"
+)
+
+// onStreamDone releases the admission slot. It runs even when the client aborts mid-upload, which the body
+// hooks do not see; without it a few aborted requests would leak slots and pin the plugin to the buffered path.
+func onStreamDone(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) {
+	if admitted, _ := ctx.GetContext(ctxKeyAdmitted).(bool); admitted {
+		ctx.SetContext(ctxKeyAdmitted, false)
+		if streamInflight > 0 {
+			streamInflight--
+		}
+		if start, _ := ctx.GetContext(ctxKeyAdmitStart).(int64); start > 0 {
+			admOnDone(time.Now().UnixNano() - start)
+		}
+	}
+}
+
 // Runtime metrics of the streaming path. The fallback rate must be watched after rollout: a fallback means full buffering, sized for the worst case until the rate is near zero.
 // Metrics are observation only: when the host does not support them (the test emulator, or a deployment with metrics disabled) they switch off silently and never affect the request.
 var (
@@ -432,6 +512,14 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		streamXformCount("skipped")
 		return fallbackOnly()
 	}
+	if float64(streamInflight) >= admLimit {
+		// Too many uploads in flight already: keep this one on the buffered path.
+		streamXformCount("admission_fallback")
+		return fallbackOnly()
+	}
+	streamInflight++
+	ctx.SetContext(ctxKeyAdmitted, true)
+	ctx.SetContext(ctxKeyAdmitStart, time.Now().UnixNano())
 	x.plan = plan
 	x.st = guard.New(&guard.Plan{
 		Tr:          plan.Tr,
