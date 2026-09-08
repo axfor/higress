@@ -49,9 +49,9 @@ description: AI 代理插件配置参考
 - `cohere` 的 chat（OpenAI → Cohere v1 chat：只取第一条消息的文本与几个标量，其余字段与消息全部丢弃，与全量路径相同）；
 - `deepl`（OpenAI → DeepL 翻译：非 system 消息的文本进 `text` 数组、system 消息进 `context`，host 由 `model` 是 Free / Pro 决定）；
 - `kling` 的 `/v1/videos`（body 原样，`model` 映射进 `model_name`；路径由是否带图片输入字段决定，body 超过窗口且尚未见到图片字段时回落）；
-- vertex 的 chat（OpenAI → Anthropic 格式，映射后模型以 `claude` 开头时）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内；映射到 Gemini 模型的请求在 `model` 出现时回落全量路径。
+- vertex 的 chat（OpenAI → Anthropic 格式或 Vertex 自己的 Gemini 格式，按映射后的模型选择）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内。Gemini 格式下 assistant 消息的内容要等 `tool_calls` 到齐（超过 1MB 回落），含 http(s) 图片链接的 URL 须在 8KB 内。
 
-其余供应商（Vertex 的 Gemini 格式转换接口、Bedrock Converse、Hunyuan、MiniMax Pro、Dify、Triton）以及配置了
+其余供应商（Vertex 的 embeddings / 生图、Bedrock Converse、Hunyuan、MiniMax Pro、Dify、Triton）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
 `firstByteTimeout` / `responseJsonSchema` / `providerBasePath`（qwen、minimax）/ `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 

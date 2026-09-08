@@ -377,8 +377,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		// onChatCompletionRequestBody decides the wire format by the mapped model: claude-prefixed models go to the
 		// Anthropic endpoint in the Claude format with model left out and anthropic_version added, everything else
 		// to the Gemini endpoint in Vertex's own request shape. The decision needs the mapped model, so the plan
-		// starts with a probe for model and picks the transformer when it turns up (guard replan). The Gemini
-		// shape is not streamed yet: those requests fall back once the model is known.
+		// starts with a probe for model and picks the transformer when it turns up (guard replan).
 		vp, ok := prov.(*vertexProvider)
 		if !ok {
 			return nil, "unexpected vertex provider instance type"
@@ -410,18 +409,40 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			if err != nil {
 				return nil, err.Error()
 			}
-			if !strings.HasPrefix(mapped, "claude") {
-				return nil, "vertex Gemini request shape is not streamed yet"
+			if strings.HasPrefix(mapped, "claude") {
+				return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewClaude(streamxform.ClaudeOptions{
+					MapModel: mapStrict, ClaudeCodeMode: c.claudeCodeMode, OmitModel: true, AnthropicVersion: vertexAnthropicVersion,
+					KeepDeveloperRole: true, // vertex's handler does not run convertDeveloperRoleToSystem
+				})}).Tr, ""
 			}
-			return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewClaude(streamxform.ClaudeOptions{
-				MapModel: mapStrict, ClaudeCodeMode: c.claudeCodeMode, OmitModel: true, AnthropicVersion: vertexAnthropicVersion,
-				KeepDeveloperRole: true, // vertex's handler does not run convertDeveloperRoleToSystem
+			var ss []streamxform.GeminiSafetySetting
+			for k, v := range c.geminiSafetySetting {
+				ss = append(ss, streamxform.GeminiSafetySetting{Category: k, Threshold: v})
+			}
+			sort.Slice(ss, func(i, j int) bool { return ss[i].Category < ss[j].Category })
+			return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewVertexGemini(streamxform.VertexGeminiOptions{
+				MapModel:       mapStrict,
+				SafetySettings: ss,
+				ApplyResponseFormat: func(rf map[string]any, mapped string) (string, map[string]any, error) {
+					var cfg vertexChatGenerationConfig
+					if err := vp.applyResponseFormatToGenerationConfig(rf, &cfg, mapped); err != nil {
+						return "", nil, err
+					}
+					return cfg.ResponseMimeType, cfg.ResponseSchema, nil
+				},
+				DetectMime: detectMimeTypeFromURL,
 			})}).Tr, ""
 		}
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
-			ctx.SetContext(contextClaudeMarker, true)
 			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
-			if err := util.OverwriteRequestPath(vp.getAhthropicRequestPath(ctx, ApiNameChatCompletion, model, pre.Stream)); err != nil {
+			var path string
+			if strings.HasPrefix(model, "claude") {
+				ctx.SetContext(contextClaudeMarker, true)
+				path = vp.getAhthropicRequestPath(ctx, ApiNameChatCompletion, model, pre.Stream)
+			} else {
+				path = vp.getRequestPath(ctx, ApiNameChatCompletion, model, pre.Stream)
+			}
+			if err := util.OverwriteRequestPath(path); err != nil {
 				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
 			}
 			auth()

@@ -338,23 +338,30 @@ func TestStreamingRequest_VertexChatClaudeModel(t *testing.T) {
 	})
 }
 
-// A mapped model without the claude prefix takes Vertex's Gemini shape, which is not streamed: the request falls back once the model is known.
-func TestStreamingRequest_VertexChatGeminiModelFallsBack(t *testing.T) {
+// A mapped model without the claude prefix takes Vertex's Gemini shape: the probe finds model, the Vertex transformer takes over.
+func TestStreamingRequest_VertexChatGeminiModel(t *testing.T) {
 	wasmtest.RunTest(t, func(t *testing.T) {
 		host, status := wasmtest.NewTestHost(streamingVertexExpressClaudeModelConfig)
 		defer host.Reset()
 		require.Equal(t, types.OnPluginStartStatusOK, status)
 		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
 
-		body := `{"model":"g","messages":[{"role":"user","content":"` + strings.Repeat("g", 100000) + `"}],"stream":true}`
+		body := `{"model":"g","stream":true,"messages":[{"role":"system","content":"S"},{"role":"user","content":"` + strings.Repeat("g", 100000) + `"}],"reasoning_effort":"low"}`
 		actions, upstream := feedChunks(host, []byte(body), 4096)
-		for i, a := range actions[:len(actions)-1] {
-			require.Equal(t, types.ActionPause, a, "chunk %d: held for the buffered path", i)
-		}
+		require.Equal(t, types.ActionPause, actions[0])
 		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		require.Less(t, 1, len(actions))
+		require.Equal(t, types.ActionContinue, actions[len(actions)/2+8], "released past the window, not held for the buffered path")
 		var out map[string]any
 		require.NoError(t, json.Unmarshal(upstream, &out))
-		require.Contains(t, out, "contents", "buffered vertex gemini conversion")
+		contents := out["contents"].([]any)
+		require.Len(t, contents, 3, "system as user, the dummy model message, the user message")
+		require.Equal(t, "model", contents[1].(map[string]any)["role"])
+		require.Equal(t, "Okay", contents[1].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"])
+		_, hasSafety := out["safetySettings"]
+		require.False(t, hasSafety, "nothing configured: omitted like the buffered omitempty field")
+		gc := out["generationConfig"].(map[string]any)
+		require.Equal(t, float64(1024), gc["thinkingConfig"].(map[string]any)["thinkingBudget"])
 		require.Contains(t, requestHeader(host, ":path"), "gemini-2.0-flash:streamGenerateContent")
 		require.Contains(t, requestHeader(host, ":path"), "key=vk")
 	})
