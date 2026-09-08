@@ -255,3 +255,56 @@ func gjsonParseInt(s string) int64 {
 	}
 	return n
 }
+
+// ---- Vertex, Anthropic Messages passthrough (/v1/messages to :rawPredict / :streamRawPredict) ----
+//
+// Buffered onAnthropicMessagesRequestBody: model is read and mapped for the path and then deleted from the body
+// (handled by OmitModel), anthropic_version is set, context_management is removed, and max_tokens is added when
+// absent. sjson.SetBytes replaces an existing key in place, so an anthropic_version already in the body is
+// rewritten where it stands and only added at the end when it never came.
+
+type VertexAnthropicVariant struct {
+	// Version is the value written into anthropic_version (vertex-2023-10-16 on the buffered path).
+	Version string
+	// DefaultMaxTokens is added when the body has no max_tokens.
+	DefaultMaxTokens int
+	versionSeen      bool
+	maxTokensSeen    bool
+}
+
+func (v *VertexAnthropicVariant) TopKey(t *Transformer, key string) (Action, bool) {
+	switch key {
+	case "anthropic_version":
+		if !v.versionSeen {
+			return Capture(256), true
+		}
+	case "max_tokens":
+		v.maxTokensSeen = true
+	case "context_management":
+		return Skip(), true
+	}
+	return Action{}, false
+}
+
+func (v *VertexAnthropicVariant) TopValue(t *Transformer, key string, raw []byte) {
+	if key == "anthropic_version" {
+		v.versionSeen = true
+		w := t.W()
+		w.KeyRaw(t.KeyRaw())
+		w.JSONString(v.Version)
+	}
+}
+
+func (v *VertexAnthropicVariant) NeedReasoningScan() bool { return false }
+
+func (v *VertexAnthropicVariant) Tail(t *Transformer, st *OpenAIState) {
+	w := t.W()
+	if !v.versionSeen {
+		w.Key("anthropic_version")
+		w.JSONString(v.Version)
+	}
+	if !v.maxTokensSeen {
+		w.Key("max_tokens")
+		w.Int(v.DefaultMaxTokens)
+	}
+}

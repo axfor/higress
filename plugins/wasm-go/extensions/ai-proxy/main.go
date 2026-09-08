@@ -708,7 +708,7 @@ func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
 	if x.plan.Passthrough {
 		// the buffered path does not touch the body: before the first chunk write back the original header info from the context (what its defer does)
 		if x.plan.AfterPrelude != nil {
-			x.plan.AfterPrelude(x.ctx) // header work the buffered path does in the body phase without reading the body (Vertex raw auth)
+			x.plan.AfterPrelude(x.ctx, pre) // header work the buffered path does in the body phase without reading the body (Vertex raw auth)
 		}
 		saveContextsToHeaders(x.ctx)
 		return true
@@ -719,7 +719,7 @@ func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
 	}
 	x.cfg.GetProviderConfig().StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, true)
 	if x.plan.AfterPrelude != nil {
-		x.plan.AfterPrelude(x.ctx)
+		x.plan.AfterPrelude(x.ctx, pre)
 	}
 	saveContextsToHeaders(x.ctx)
 	return true

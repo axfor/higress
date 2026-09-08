@@ -276,3 +276,35 @@ func TestStreamingRequest_VertexRawExpress(t *testing.T) {
 		require.Equal(t, "", requestHeader(host, "Authorization"))
 	})
 }
+
+var streamingVertexAnthropicExpressConfig = json.RawMessage(`{"provider":{"type":"vertex","apiTokens":["vk"],"modelMapping":{"m":"claude-sonnet-4@20250514"}}}`)
+
+// Vertex /v1/messages in Express mode: the Anthropic body is kept, model moves into the path, the vertex-side fields are adjusted.
+func TestStreamingRequest_VertexAnthropicExpress(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingVertexAnthropicExpressConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		hdrs := streamingRequestHeaders("/v1/messages")
+		hdrs = append(hdrs, [2]string{"Authorization", "Bearer client-token"}, [2]string{"anthropic-version", "2023-06-01"})
+		host.CallOnHttpRequestHeaders(hdrs)
+
+		body := `{"model":"m","stream":true,"context_management":{"edits":[]},"messages":[{"role":"user","content":"` + strings.Repeat("a", 100000) + `"}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0], "held until the commit point")
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		_, hasModel := out["model"]
+		require.False(t, hasModel, "vertex :rawPredict rejects model in the body")
+		require.Equal(t, "vertex-2023-10-16", out["anthropic_version"])
+		require.Equal(t, float64(4096), out["max_tokens"])
+		_, hasCM := out["context_management"]
+		require.False(t, hasCM)
+		require.Len(t, out["messages"].([]any), 1)
+		require.Equal(t, "/v1/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict?key=vk", requestHeader(host, ":path"))
+		require.Equal(t, "aiplatform.googleapis.com", requestHeader(host, ":authority"))
+		require.Equal(t, "", requestHeader(host, "Authorization"))
+		require.Equal(t, "", requestHeader(host, "anthropic-version"))
+	})
+}

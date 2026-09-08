@@ -16,6 +16,9 @@ type OpenAIOptions struct {
 	// ModelOnlyIfPresent: the buffered path only rewrites with sjson when model is present (Qwen compatible mode);
 	// the default path adds "model":<result of mapping the empty string> when it is missing.
 	ModelOnlyIfPresent bool
+	// OmitModel: model is read and mapped for the Prelude but not written, as when the buffered path deletes it
+	// after reading (Vertex's Anthropic endpoints take the model from the path).
+	OmitModel bool
 	// DetectStream: chat / videos / video_remix need to read stream (the side effects are applied by the integration layer).
 	DetectStream bool
 	// NormalizeUsage: chat / completion with usage statistics enabled add include_usage when stream is true.
@@ -205,6 +208,9 @@ func (p *openaiProto) OnValue(t *Transformer, raw []byte) {
 			p.st.ModelSeen = true
 			p.st.Model = s
 			p.st.Mapped = p.opt.MapModel(s)
+			if p.opt.OmitModel {
+				return
+			}
 			w := t.W()
 			w.KeyRaw(t.KeyRaw()) // keep the original spelling of "model":, as sjson's in-place rewrite does
 			w.JSONString(p.st.Mapped)

@@ -39,7 +39,7 @@ type StreamPlan struct {
 	// Not seen by the end of the body counts as false, as on the buffered path.
 	RequireStreamBeforeCommit bool
 	// AfterPrelude is called after the context keys are written and before the headers are released: header changes that depend on body facts (the Azure path).
-	AfterPrelude func(ctx wrapper.HttpContext)
+	AfterPrelude func(ctx wrapper.HttpContext, pre streamxform.Prelude)
 	// OnFinish is called after the whole body has been scanned: context keys that are only known at the end and only used on the response side.
 	OnFinish func(ctx wrapper.HttpContext)
 }
@@ -191,7 +191,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		p := checkChatRequestTypes(&StreamPlan{Tr: tr, ApplyStream: true, ApplyModel: true})
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
-		p.AfterPrelude = func(ctx wrapper.HttpContext) {
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			// reproduce the header / path handling of onChatCompletionRequestBody
 			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
 			if strings.HasPrefix(model, qwenVlModelPrefixName) {
@@ -241,7 +241,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		opts := defaultOpts(nil)
 		opts.DetectStream = false // this buffered branch sets neither Accept / isStreaming nor the model context keys
 		p := &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}
-		p.AfterPrelude = func(ctx wrapper.HttpContext) {
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			// the buffered path only switches to the v2 endpoint in the body phase (not in the header phase); the path is fixed and independent of body fields
 			if err := util.OverwriteRequestPath(minimaxChatCompletionV2Path); err != nil {
 				log.Errorf("minimaxProvider: overwrite request path failed: %v", err)
@@ -305,12 +305,63 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		// buffered onChatCompletionRequestBody: path = /{version}/models/{mapped model}:{generateContent|streamGenerateContent}
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
-		p.AfterPrelude = func(ctx wrapper.HttpContext) {
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
 			stream, _ := ctx.GetContext(ctxKeyIsStreaming).(bool)
 			if err := util.OverwriteRequestPath(gp.getRequestPath(ApiNameChatCompletion, model, stream)); err != nil {
 				log.Errorf("geminiProvider: overwrite request path failed: %v", err)
 			}
+		}
+		return p, ""
+
+	case c.typ == providerTypeVertex && apiName == ApiNameAnthropicMessages:
+		// /v1/messages goes to :rawPredict / :streamRawPredict with the Anthropic body kept: model is read for the path
+		// and dropped from the body, anthropic_version and a default max_tokens are added, context_management removed.
+		// The buffered path does not set Accept or isStreaming here; stream is read only for the path.
+		vp, ok := prov.(*vertexProvider)
+		if !ok {
+			return nil, "unexpected vertex provider instance type"
+		}
+		auth, why := c.vertexAuth(vp)
+		if why != "" {
+			return nil, why
+		}
+		p := &StreamPlan{Tr: streamxform.NewOpenAI(streamxform.OpenAIOptions{
+			MapModel: mapLenient, DetectStream: true, OmitModel: true, DeveloperRoleSupported: true,
+			Variant: &streamxform.VertexAnthropicVariant{Version: vertexAnthropicVersion, DefaultMaxTokens: claudeDefaultMaxTokens},
+		}), ApplyModel: true, RequireModelBeforeCommit: true, RequireStreamBeforeCommit: true}
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			if err := util.OverwriteRequestPath(vp.getAhthropicRequestPath(ctx, ApiNameAnthropicMessages, model, pre.Stream)); err != nil {
+				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
+			}
+			auth()
+		}
+		return p, ""
+
+	case c.typ == providerTypeVertex && c.vertexOpenAICompatible && isChat:
+		// OpenAI-compatible endpoint: the body stays OpenAI, model is mapped, the path is fixed. parseRequestAndMapModel
+		// decodes into the request struct (type check) and sets Accept from stream on the live headers, which the
+		// header snapshot then overwrites (NoAcceptHeader); isStreaming is set.
+		vp, ok := prov.(*vertexProvider)
+		if !ok {
+			return nil, "unexpected vertex provider instance type"
+		}
+		auth, why := c.vertexAuth(vp)
+		if why != "" {
+			return nil, why
+		}
+		opts := defaultOpts(nil)
+		opts.NormalizeUsage = false
+		opts.CheckMessages = false
+		opts.DeveloperRoleSupported = true
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true})
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			ctx.SetContext(contextOpenAICompatibleMarker, true)
+			if err := util.OverwriteRequestPath(vp.getOpenAICompatibleRequestPath()); err != nil {
+				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
+			}
+			auth()
 		}
 		return p, ""
 
@@ -337,7 +388,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		p := defaultPlan(nil)
 		p.RequireModelBeforeCommit = !azureModelIrrelevantApis[apiName] &&
 			(ap.serviceUrlType == azureServiceUrlTypeDomainOnly || ap.serviceUrlType == azureServiceUrlTypeOpenAIV1Base)
-		p.AfterPrelude = func(ctx wrapper.HttpContext) {
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			if path := ap.transformRequestPath(ctx, apiName); path != "" {
 				if err := util.OverwriteRequestPath(path); err != nil {
 					log.Errorf("azureProvider: overwrite request path to %s failed: %v", path, err)
@@ -425,10 +476,23 @@ func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName 
 	}
 }
 
+// vertexAuth returns what the buffered path does for authentication once the headers are final: Express mode
+// carries the API key in the query string (added with the path) and drops the client's Authorization header;
+// the standard mode needs the OAuth token, which the buffered path fetches asynchronously and caches. Until it
+// is cached the request takes that path, so only the first request after a cold start is buffered.
+func (c *ProviderConfig) vertexAuth(vp *vertexProvider) (apply func(), why string) {
+	if vp.isExpressMode() {
+		return func() { _ = proxywasm.RemoveHttpRequestHeader("Authorization") }, ""
+	}
+	token, err := vp.getCachedAccessToken(vp.buildTokenKey())
+	if err != nil || token == "" {
+		return nil, "vertex access token not cached yet, the buffered path fetches it"
+	}
+	return func() { _ = proxywasm.ReplaceHttpRequestHeader("Authorization", "Bearer "+token) }, ""
+}
+
 // vertexRawPlan streams the native Vertex REST endpoints, which the buffered path forwards untouched and only
-// authenticates: Express mode puts the API key in the query string, the standard mode needs an OAuth token.
-// The token is fetched asynchronously by the buffered path and cached; until it is cached the request takes
-// that path, so only the first request after a cold start is buffered.
+// authenticates; in Express mode the key is appended to the path the client sent.
 func (c *ProviderConfig) vertexRawPlan(ctx wrapper.HttpContext, prov Provider) (*StreamPlan, string) {
 	vp, ok := prov.(*vertexProvider)
 	if !ok {
@@ -437,21 +501,18 @@ func (c *ProviderConfig) vertexRawPlan(ctx wrapper.HttpContext, prov Provider) (
 	if !c.isSupportedAPI(ApiNameVertexRaw) {
 		return nil, "apiName not supported"
 	}
+	auth, why := c.vertexAuth(vp)
+	if why != "" {
+		return nil, why
+	}
 	ctx.SetContext(contextVertexRawMarker, true)
-	if vp.isExpressMode() {
-		return &StreamPlan{Passthrough: true, AfterPrelude: func(ctx wrapper.HttpContext) {
+	return &StreamPlan{Passthrough: true, AfterPrelude: func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+		if vp.isExpressMode() {
 			path, _ := proxywasm.GetHttpRequestHeader(":path")
 			if err := util.OverwriteRequestPath(appendOrReplaceAPIKey(path, vp.getExpressAPIKey(ctx))); err != nil {
 				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
 			}
-			_ = proxywasm.RemoveHttpRequestHeader("Authorization")
-		}}, ""
-	}
-	token, err := vp.getCachedAccessToken(vp.buildTokenKey())
-	if err != nil || token == "" {
-		return nil, "vertex access token not cached yet, the buffered path fetches it"
-	}
-	return &StreamPlan{Passthrough: true, AfterPrelude: func(ctx wrapper.HttpContext) {
-		_ = proxywasm.ReplaceHttpRequestHeader("Authorization", "Bearer "+token)
+		}
+		auth()
 	}}, ""
 }

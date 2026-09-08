@@ -40,9 +40,11 @@ Request bodies are now processed as a stream by default: each chunk is transform
 - native Gemini `generateContent` / `streamGenerateContent` (the buffered path leaves these bodies untouched; chunks are forwarded as-is);
 - every provider under `protocol: original` (the buffered path does not touch the body there), except hunyuan and bedrock in AK/SK mode, which sign the body, and minimax in Pro mode, which rebuilds it;
 - bedrock Mantle `/v1/messages` with apiTokens (model mapping and the Accept header only; AK/SK mode signs the body with SigV4 and keeps the buffered path);
-- vertex native REST passthrough (Express mode puts the API key in the query string; the standard mode streams once the OAuth token is cached, so the first request after a cold start is buffered while it is fetched).
+- vertex native REST passthrough (Express mode puts the API key in the query string; the standard mode streams once the OAuth token is cached, so the first request after a cold start is buffered while it is fetched);
+- vertex `/v1/messages` passthrough (the Anthropic body goes to `:rawPredict` / `:streamRawPredict` as it is, with `model` removed, `anthropic_version` and a default `max_tokens` added and `context_management` dropped; the path depends on model and stream, both must appear within the window);
+- vertex OpenAI-compatible mode (`vertexOpenAICompatible`) for chat (model mapping and a fixed path only; same token requirement).
 
-Other providers (Vertex conversions, Bedrock Converse, Cohere, Hunyuan, MiniMax Pro, Dify, DeepL, Triton, Kling) and requests configured with `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` / `firstByteTimeout` / `responseJsonSchema` / `providerBasePath` (qwen, minimax) / `qwenFileIds` (native qwen) keep using the buffered path unchanged.
+Other providers (Vertex Gemini / Claude conversions, Bedrock Converse, Cohere, Hunyuan, MiniMax Pro, Dify, DeepL, Triton, Kling) and requests configured with `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` / `firstByteTimeout` / `responseJsonSchema` / `providerBasePath` (qwen, minimax) / `qwenFileIds` (native qwen) keep using the buffered path unchanged.
 
 Metrics: counters `ai_proxy.stream_xform.streamed` / `fallback` / `uncoverable` / `skipped` (exported by Envoy under the `wasmcustom.` prefix) (streamed, fell back to the buffered path, failed after the commit point, not applicable for the provider/config). The fallback rate should stay near zero; otherwise memory capacity still has to be planned for full buffering.
 

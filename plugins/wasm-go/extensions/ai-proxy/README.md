@@ -43,9 +43,11 @@ description: AI 代理插件配置参考
 - Gemini 原生 `generateContent` / `streamGenerateContent`（全量路径本就不改 body，逐块放行）；
 - `protocol: original` 的所有供应商（全量路径在 original 下不碰 body），例外是对 body 签名的 hunyuan 与 AK/SK 模式的 bedrock，以及在 original 下同样重建 body 的 Pro 接口模式 minimax；
 - bedrock Mantle `/v1/messages`（apiTokens 模式，只做模型映射与 Accept 头；AK/SK 模式要对 body 做 SigV4 签名，仍走全量）；
-- vertex 原生 REST 直通（Express 模式 API key 进 query；标准模式在 OAuth token 已缓存时流式，冷启动后第一个请求由全量路径取 token）。
+- vertex 原生 REST 直通（Express 模式 API key 进 query；标准模式在 OAuth token 已缓存时流式，冷启动后第一个请求由全量路径取 token）；
+- vertex 的 `/v1/messages` 直通（Anthropic body 原样送 `:rawPredict` / `:streamRawPredict`，只删 `model`、补 `anthropic_version` 与默认 `max_tokens`、去掉 `context_management`；路径依赖 model 与 stream，二者须出现在窗口内）；
+- vertex OpenAI 兼容模式（`vertexOpenAICompatible`）的 chat（只做模型映射与固定路径；token 缓存要求同上）。
 
-其余供应商（Vertex 的转换接口、Bedrock Converse、Cohere、Hunyuan、MiniMax Pro、Dify、DeepL、Triton、Kling）以及配置了
+其余供应商（Vertex 的 Gemini / Claude 格式转换接口、Bedrock Converse、Cohere、Hunyuan、MiniMax Pro、Dify、DeepL、Triton、Kling）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
 `firstByteTimeout` / `responseJsonSchema` / `providerBasePath`（qwen、minimax）/ `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 
