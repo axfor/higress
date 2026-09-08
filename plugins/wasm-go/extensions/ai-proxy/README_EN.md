@@ -42,7 +42,8 @@ Request bodies are now processed as a stream by default: each chunk is transform
 - bedrock Mantle `/v1/messages` with apiTokens (model mapping and the Accept header only; AK/SK mode signs the body with SigV4 and keeps the buffered path);
 - vertex native REST passthrough (Express mode puts the API key in the query string; the standard mode streams once the OAuth token is cached, so the first request after a cold start is buffered while it is fetched);
 - vertex `/v1/messages` passthrough (the Anthropic body goes to `:rawPredict` / `:streamRawPredict` as it is, with `model` removed, `anthropic_version` and a default `max_tokens` added and `context_management` dropped; the path depends on model and stream, both must appear within the window);
-- vertex OpenAI-compatible mode (`vertexOpenAICompatible`) for chat (model mapping and a fixed path only; same token requirement).
+- vertex OpenAI-compatible mode (`vertexOpenAICompatible`) for chat (model mapping and a fixed path only; same token requirement);
+- vertex chat (OpenAI → Anthropic format, when the mapped model starts with `claude`): a probe finds `model`, the transformer is chosen from the mapped name and restarted from the first byte (the guard's replan); `model` and `stream` must appear within the window. Requests mapped to a Gemini model fall back once the model is known.
 
 Other providers (Vertex Gemini / Claude conversions, Bedrock Converse, Cohere, Hunyuan, MiniMax Pro, Dify, DeepL, Triton, Kling) and requests configured with `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` / `firstByteTimeout` / `responseJsonSchema` / `providerBasePath` (qwen, minimax) / `qwenFileIds` (native qwen) keep using the buffered path unchanged.
 

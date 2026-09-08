@@ -45,6 +45,13 @@ type Plan struct {
 	// that does -- because after that the retreat the window keeps open is one it would never take. The
 	// window then bounds only the documents where that moment never comes.
 	EarlyCommit func(pre streamxform.Prelude) bool
+	// Replan, when set, is asked once the transformer has reported model and nothing has been released yet.
+	// It returns the transformer the request really needs -- a choice that depends on the mapped model, which
+	// the buffered path makes after decoding the whole body -- and the driver feeds it every byte received so
+	// far, read back from the host buffer where they still sit, before carrying on with it. Until then the
+	// plan's transformer only has to find model; a key probe does. Returning nil asks for the buffered path.
+	// Asked at most once. Model not seen before the release point is the plan's OnCommit to refuse.
+	Replan func(pre streamxform.Prelude) (*streamxform.Transformer, string)
 	// Fallback is the plugin's buffered path, called once the whole body is collected. If the buffered handler calls
 	// ReplaceHttpRequestBody itself, the driver reads that content back and returns it. ActionPause means the handler answered locally or waits for an async result.
 	Fallback func(body []byte) types.Action
@@ -83,12 +90,19 @@ var keyCache = streamxform.NewKeyCache()
 func New(p *Plan) *State {
 	s := &State{plan: p}
 	if p.Tr != nil {
-		p.Tr.SetKeyCache(keyCache)
-	}
-	if p.Tr != nil && p.Mode != Observe && !p.Passthrough {
-		p.Tr.SetSink(func(b []byte) { s.out = append(s.out, b...) })
+		s.attach(p.Tr)
 	}
 	return s
+}
+
+// attach wires a transformer into this state: the key cache shared by the VM and, outside Observe and
+// passthrough, the sink that collects its output into out.
+func (s *State) attach(tr *streamxform.Transformer) {
+	s.plan.Tr = tr
+	tr.SetKeyCache(keyCache)
+	if s.plan.Mode != Observe && !s.plan.Passthrough {
+		tr.SetSink(func(b []byte) { s.out = append(s.out, b...) })
+	}
 }
 
 // prelude returns the protocol's prelude, from the transformer while it is alive and from the copy kept when
@@ -194,6 +208,28 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	}
 	s.out = s.out[:0]
 	tr.Write(chunk)
+	if s.plan.Replan != nil && !s.sent {
+		if bad, _ := tr.Unsupported(); !bad {
+			if pre := Prelude(tr); pre.ModelSeen {
+				nt, why := s.plan.Replan(pre)
+				s.plan.Replan = nil
+				if nt == nil {
+					return s.toFallback(last, why, "replan")
+				}
+				// Nothing has been released: the bytes scanned so far are still in the host buffer, so the
+				// new transformer starts from the beginning, the way a fallback does, and takes over from here.
+				raw, err := hostRequestBody(0, s.total)
+				if err != nil {
+					return s.toFallback(last, "replan could not read the body back: "+err.Error(), "replan")
+				}
+				s.metric("replanned")
+				s.out = s.out[:0]
+				s.attach(nt)
+				tr = nt
+				tr.Write(raw)
+			}
+		}
+	}
 	if !last && !tr.Committed() && s.plan.EarlyCommit != nil && s.plan.EarlyCommit(Prelude(tr)) {
 		s.metric("early_commit")
 		tr.CommitNow() // releases what has accumulated through the sink, so out is ready below

@@ -26,6 +26,14 @@ type ClaudeOptions struct {
 	MapModel func(model string) (string, error)
 	// ClaudeCodeMode mirrors the provider setting claudeCodeMode: system becomes an array with cache_control.
 	ClaudeCodeMode bool
+	// OmitModel leaves model out of the output (Vertex takes it from the path); it is still mapped for the Prelude.
+	OmitModel bool
+	// AnthropicVersion, when set, is written as anthropic_version (Vertex's rawPredict wants vertex-2023-10-16).
+	AnthropicVersion string
+	// KeepDeveloperRole leaves a developer message as an ordinary message with that role. The buffered claude path
+	// runs convertDeveloperRoleToSystem before decoding, so developer normally means system; Vertex's own request
+	// handler skips that step and hands the role to Claude as it came.
+	KeepDeveloperRole bool
 }
 
 const (
@@ -325,7 +333,7 @@ func (p *claudeProto) msgKey(t *Transformer) Action {
 		}
 		m.contentSeen = true
 		switch m.role {
-		case "system", "developer":
+		case "system":
 			return Capture(systemCap) // must move to the top-level system as a whole; the cap matches the buffered body limit
 		case "tool":
 			return Capture(assistantWaitCap)
@@ -507,18 +515,21 @@ func (p *claudeProto) msgValue(t *Transformer, raw []byte) {
 			return
 		}
 		m.role, m.roleSeen = s, true
+		if s == "developer" && !p.opt.KeepDeveloperRole {
+			m.role = "system" // convertDeveloperRoleToSystem runs before the buffered decode
+		}
 		// buffered path: system messages are skipped with continue and do not affect "the previous output message",
 		// so tool_result merging can reach across a system message.
-		if p.openToolResult && s != "tool" && s != "system" && s != "developer" {
+		if p.openToolResult && m.role != "tool" && m.role != "system" {
 			p.closeToolResult(t)
 		}
 		if s != "assistant" && len(t.Deferred()) > 0 {
 			t.Release() // content arrived first: the role is known now, replay
 		}
 	case "content":
-		// only the content of system / developer / tool messages is Captured here
+		// only the content of system / tool messages is Captured here (developer counts as system unless kept)
 		switch m.role {
-		case "system", "developer":
+		case "system":
 			p.sysSeen = true
 			if len(raw) > 0 && raw[0] == '"' {
 				p.sysRaw = append([]byte(nil), raw...) // string: not decoded, written verbatim
@@ -712,7 +723,7 @@ func (p *claudeProto) finishMessage(t *Transformer) {
 	}
 	m.finalizing = true
 	switch m.role {
-	case "system", "developer":
+	case "system":
 		if len(t.Deferred()) > 0 {
 			t.ReleaseNow()
 		}
@@ -820,9 +831,13 @@ func (p *claudeProto) Tail(t *Transformer) {
 		t.Bail(err.Error())
 		return
 	}
-	if mapped != "" {
+	if mapped != "" && !p.opt.OmitModel {
 		w.Key("model")
 		w.JSONString(mapped)
+	}
+	if p.opt.AnthropicVersion != "" {
+		w.Key("anthropic_version")
+		w.JSONString(p.opt.AnthropicVersion)
 	}
 	if p.msgCount == 0 {
 		w.Key("messages")

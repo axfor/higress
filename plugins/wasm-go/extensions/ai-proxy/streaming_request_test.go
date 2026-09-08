@@ -308,3 +308,54 @@ func TestStreamingRequest_VertexAnthropicExpress(t *testing.T) {
 		require.Equal(t, "", requestHeader(host, "anthropic-version"))
 	})
 }
+
+var streamingVertexExpressClaudeModelConfig = json.RawMessage(`{"provider":{"type":"vertex","apiTokens":["vk"],"modelMapping":{"m":"claude-sonnet-4@20250514","g":"gemini-2.0-flash"}}}`)
+
+// Vertex chat with a claude-prefixed mapped model: the probe finds model, the Claude transformer takes over from the first byte.
+func TestStreamingRequest_VertexChatClaudeModel(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingVertexExpressClaudeModelConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		hdrs := append(streamingRequestHeaders("/v1/chat/completions"), [2]string{"Authorization", "Bearer client-token"})
+		host.CallOnHttpRequestHeaders(hdrs)
+
+		body := `{"messages":[{"role":"system","content":"S"},{"role":"user","content":"` + strings.Repeat("c", 100000) + `"}],"model":"m","stream":true,"max_tokens":32}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		_, hasModel := out["model"]
+		require.False(t, hasModel)
+		require.Equal(t, "vertex-2023-10-16", out["anthropic_version"])
+		require.Equal(t, float64(32), out["max_tokens"])
+		require.Equal(t, "S", out["system"])
+		require.Equal(t, true, out["stream"])
+		require.Len(t, out["messages"].([]any), 1)
+		require.Equal(t, "/v1/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict?key=vk", requestHeader(host, ":path"))
+		require.Equal(t, "", requestHeader(host, "Authorization"))
+	})
+}
+
+// A mapped model without the claude prefix takes Vertex's Gemini shape, which is not streamed: the request falls back once the model is known.
+func TestStreamingRequest_VertexChatGeminiModelFallsBack(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingVertexExpressClaudeModelConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		body := `{"model":"g","messages":[{"role":"user","content":"` + strings.Repeat("g", 100000) + `"}],"stream":true}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		for i, a := range actions[:len(actions)-1] {
+			require.Equal(t, types.ActionPause, a, "chunk %d: held for the buffered path", i)
+		}
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Contains(t, out, "contents", "buffered vertex gemini conversion")
+		require.Contains(t, requestHeader(host, ":path"), "gemini-2.0-flash:streamGenerateContent")
+		require.Contains(t, requestHeader(host, ":path"), "key=vk")
+	})
+}

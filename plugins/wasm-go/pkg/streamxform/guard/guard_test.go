@@ -461,3 +461,107 @@ func TestPrefixTransformWindowCommitIsCompleteWhenFieldsFollowTheWindow(t *testi
 		}
 	}
 }
+
+// A plan whose transformer depends on the model: a probe finds model, Replan picks the real transformer, and
+// the driver restarts it from the first byte. The output has to equal the chosen transformer run on its own,
+// under any split, with the choice made exactly once; model beyond the window is the plan's own refusal.
+func TestReplanRestartsTheChosenTransformerFromTheFirstByte(t *testing.T) {
+	strip := func(m string) string {
+		if i := strings.Index(m, "/"); i >= 0 {
+			return m[i+1:]
+		}
+		return m
+	}
+	type run struct {
+		out      string
+		replans  int
+		fallback int
+	}
+	feed := func(body []byte, splits []int, choose bool) run {
+		stubHost(t, body)
+		r := run{}
+		p := &Plan{
+			Tr:       streamxform.NewKeyProbe(streamxform.KeyProbeOptions{Keys: map[string]int{"model": 4096}, ModelKey: "model", Observe: true}),
+			Mode:     Transform,
+			OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen },
+			Replan: func(pre streamxform.Prelude) (*streamxform.Transformer, string) {
+				r.replans++
+				if !choose {
+					return nil, "no transformer for this model"
+				}
+				return streamxform.NewOpenAI(streamxform.OpenAIOptions{MapModel: strip}), ""
+			},
+			Metric: func(n string) {
+				if n == "fallback" {
+					r.fallback++
+				}
+			},
+		}
+		s := New(p)
+		var out []byte
+		prev := 0
+		for i, cut := range splits {
+			o, _ := s.Feed(body[prev:cut], i == len(splits)-1)
+			out = append(out, o...)
+			prev = cut
+		}
+		r.out = string(out)
+		return r
+	}
+	every := func(n int, stride int) [][]int {
+		var all [][]int
+		for cut := 1; cut < n; cut += stride {
+			all = append(all, []int{cut, n})
+		}
+		all = append(all, []int{n})
+		return all
+	}
+	small := []byte(`{"messages":[{"role":"user","content":"` + big(3000) + `"}],"model":"p/m1","stream":true}`)
+	large := []byte(`{"model":"p/m1","messages":[{"role":"user","content":"` + big(200<<10) + `"}],"max_tokens":16}`)
+	late := []byte(`{"messages":[{"role":"user","content":"` + big(70000) + `"}],"model":"p/m1"}`)
+
+	for _, c := range []struct {
+		name   string
+		body   []byte
+		stride int
+	}{{"model last, small", small, 1}, {"model first, large", large, 997}} {
+		want := strings.Replace(string(c.body), `"p/m1"`, `"m1"`, 1)
+		for _, sp := range every(len(c.body), c.stride) {
+			r := feed(c.body, sp, true)
+			if r.out != want {
+				t.Fatalf("%s splits=%v: output differs: %q", c.name, sp, tailOf(r.out))
+			}
+			if r.replans != 1 || r.fallback != 0 {
+				t.Fatalf("%s splits=%v: replans=%d fallback=%d", c.name, sp, r.replans, r.fallback)
+			}
+		}
+	}
+	// Replan declines: the buffered path gets the original body, once.
+	for _, sp := range every(len(small), 7) {
+		r := feed(small, sp, false)
+		if r.out != string(small) || r.replans != 1 || r.fallback != 1 {
+			t.Fatalf("declined replan splits=%v: replans=%d fallback=%d out=%q", sp, r.replans, r.fallback, tailOf(r.out))
+		}
+	}
+	// model beyond the window. Delivered in chunks that end before it, OnCommit refuses at the window and Replan
+	// is never consulted; a split that carries the window crossing and model in one chunk releases nothing
+	// before model is known, so that one replans and must produce the transform. Never anything in between.
+	wantLate := strings.Replace(string(late), `"p/m1"`, `"m1"`, 1)
+	for _, sp := range every(len(late), 331) {
+		r := feed(late, sp, true)
+		switch {
+		case r.replans == 1 && r.fallback == 0 && r.out == wantLate:
+		case r.replans == 0 && r.fallback == 1 && r.out == string(late):
+		default:
+			t.Fatalf("late model splits=%v: replans=%d fallback=%d out=%q", sp, r.replans, r.fallback, tailOf(r.out))
+		}
+	}
+	var fixed []int
+	for i := 4096; i < len(late); i += 4096 {
+		fixed = append(fixed, i)
+	}
+	fixed = append(fixed, len(late))
+	if r := feed(late, fixed, true); r.replans != 0 || r.fallback != 1 || r.out != string(late) {
+		t.Fatalf("late model in 4KB chunks: replans=%d fallback=%d out=%q", r.replans, r.fallback, tailOf(r.out))
+	}
+}

@@ -42,6 +42,10 @@ type StreamPlan struct {
 	AfterPrelude func(ctx wrapper.HttpContext, pre streamxform.Prelude)
 	// OnFinish is called after the whole body has been scanned: context keys that are only known at the end and only used on the response side.
 	OnFinish func(ctx wrapper.HttpContext)
+	// Replan picks the real transformer once model is known, for providers whose wire format depends on the mapped
+	// model (Vertex: a claude-prefixed model takes the Anthropic format, anything else the Gemini one). Tr is then only
+	// a probe for model. See guard.Plan.Replan.
+	Replan func(pre streamxform.Prelude) (*streamxform.Transformer, string)
 }
 
 // streamDefaultProviders are the providers that go through defaultTransformRequestBody
@@ -359,6 +363,61 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			ctx.SetContext(contextOpenAICompatibleMarker, true)
 			if err := util.OverwriteRequestPath(vp.getOpenAICompatibleRequestPath()); err != nil {
+				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
+			}
+			auth()
+		}
+		return p, ""
+
+	case c.typ == providerTypeVertex && isChat:
+		// onChatCompletionRequestBody decides the wire format by the mapped model: claude-prefixed models go to the
+		// Anthropic endpoint in the Claude format with model left out and anthropic_version added, everything else
+		// to the Gemini endpoint in Vertex's own request shape. The decision needs the mapped model, so the plan
+		// starts with a probe for model and picks the transformer when it turns up (guard replan). The Gemini
+		// shape is not streamed yet: those requests fall back once the model is known.
+		vp, ok := prov.(*vertexProvider)
+		if !ok {
+			return nil, "unexpected vertex provider instance type"
+		}
+		auth, why := c.vertexAuth(vp)
+		if why != "" {
+			return nil, why
+		}
+		mapStrict := func(m string) (string, error) {
+			if m == "" {
+				return "", errors.New("missing model in request")
+			}
+			mapped := getMappedModel(m, c.modelMapping)
+			if mapped == "" {
+				return "", errors.New("model becomes empty after applying the configured mapping")
+			}
+			return mapped, nil
+		}
+		p := &StreamPlan{
+			Tr:                        streamxform.NewKeyProbe(streamxform.KeyProbeOptions{Keys: map[string]int{"model": 4 << 10}, ModelKey: "model", Observe: true}),
+			ApplyStream:               true,
+			ApplyModel:                true,
+			NoAcceptHeader:            true,
+			RequireModelBeforeCommit:  true,
+			RequireStreamBeforeCommit: true,
+		}
+		p.Replan = func(pre streamxform.Prelude) (*streamxform.Transformer, string) {
+			mapped, err := mapStrict(pre.Model)
+			if err != nil {
+				return nil, err.Error()
+			}
+			if !strings.HasPrefix(mapped, "claude") {
+				return nil, "vertex Gemini request shape is not streamed yet"
+			}
+			return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewClaude(streamxform.ClaudeOptions{
+				MapModel: mapStrict, ClaudeCodeMode: c.claudeCodeMode, OmitModel: true, AnthropicVersion: vertexAnthropicVersion,
+				KeepDeveloperRole: true, // vertex's handler does not run convertDeveloperRoleToSystem
+			})}).Tr, ""
+		}
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			ctx.SetContext(contextClaudeMarker, true)
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			if err := util.OverwriteRequestPath(vp.getAhthropicRequestPath(ctx, ApiNameChatCompletion, model, pre.Stream)); err != nil {
 				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
 			}
 			auth()

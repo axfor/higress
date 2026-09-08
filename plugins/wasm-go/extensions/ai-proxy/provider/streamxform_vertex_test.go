@@ -5,6 +5,8 @@ package provider
 // field, and the request path derived from the prelude against the one the buffered path wrote.
 
 import (
+	"encoding/json"
+	"errors"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -92,5 +94,69 @@ func TestVertexAnthropicFuzz(t *testing.T) {
 			parts = append(parts, `"model":"claude-sonnet-4-5"`)
 		}
 		checkVertexAnthropic(t, v, "{"+strings.Join(parts, ",")+"}")
+	}
+}
+
+// officialVertexClaude reproduces onChatCompletionRequestBody's claude branch: decode, strict model mapping,
+// buildClaudeTextGenRequest with model cleared and anthropic_version set, and the :rawPredict path.
+func officialVertexClaude(v *vertexProvider, in string) (map[string]any, string, error) {
+	req := &chatCompletionRequest{}
+	if err := decodeChatCompletionRequest([]byte(in), req); err != nil {
+		return nil, "", err
+	}
+	if req.Model == "" {
+		return nil, "", errors.New("missing model in request")
+	}
+	req.Model = getMappedModel(req.Model, v.config.modelMapping)
+	if req.Model == "" {
+		return nil, "", errors.New("model becomes empty after applying the configured mapping")
+	}
+	cr := v.claude.buildClaudeTextGenRequest(req)
+	cr.Model = ""
+	cr.AnthropicVersion = vertexAnthropicVersion
+	b, err := json.Marshal(cr)
+	if err != nil {
+		return nil, "", err
+	}
+	m, err := decodeMap(b)
+	if err != nil {
+		return nil, "", err
+	}
+	return m, v.getAhthropicRequestPath(newMapCtx(), ApiNameChatCompletion, req.Model, req.Stream), nil
+}
+
+func vertexClaudeStream(v *vertexProvider) *streamxform.Transformer {
+	mapStrict := func(m string) (string, error) {
+		if m == "" {
+			return "", errors.New("missing model in request")
+		}
+		mapped := getMappedModel(m, v.config.modelMapping)
+		if mapped == "" {
+			return "", errors.New("model becomes empty after applying the configured mapping")
+		}
+		return mapped, nil
+	}
+	return typed(streamxform.NewClaude(streamxform.ClaudeOptions{MapModel: mapStrict, OmitModel: true, AnthropicVersion: vertexAnthropicVersion, KeepDeveloperRole: true}))
+}
+
+// The Claude differential corpus, through Vertex's claude branch: model left out, anthropic_version added, path from model and stream.
+func TestVertexClaudeDifferential(t *testing.T) {
+	v := newAnthropicVertexProvider(false)
+	v.claude = &claudeProvider{config: v.config}
+	for _, c := range diffCases { // developer-role cases included: vertex keeps the role as it came
+		off, wantPath, err := officialVertexClaude(v, c.in)
+		for _, cs := range []int{1, 7, 4096} {
+			tr := vertexClaudeStream(v)
+			str, ok, why := runStream(tr, c.in, cs)
+			if err != nil {
+				require.False(t, ok, "%s chunk=%d: buffered failed (%v) but streaming passed", c.name, cs, err)
+				continue
+			}
+			require.True(t, ok, "%s chunk=%d unexpected fallback: %s", c.name, cs, why)
+			require.Empty(t, diffMaps(off, str), "%s chunk=%d", c.name, cs)
+			pre := tr.Protocol().(streamxform.Preluder).Prelude()
+			mapped := getMappedModel(pre.Model, v.config.modelMapping)
+			require.Equal(t, wantPath, v.getAhthropicRequestPath(newMapCtx(), ApiNameChatCompletion, mapped, pre.Stream), "%s chunk=%d path", c.name, cs)
+		}
 	}
 }

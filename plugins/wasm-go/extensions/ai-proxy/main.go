@@ -681,6 +681,16 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		plan.Tr.SetCommitBytes(streamCommitWindowBytes) // before the first Write, which happens in Feed
 	}
 	x.plan = plan
+	var replan func(streamxform.Prelude) (*streamxform.Transformer, string)
+	if plan.Replan != nil {
+		replan = func(pre streamxform.Prelude) (*streamxform.Transformer, string) {
+			tr, why := plan.Replan(pre)
+			if tr != nil && streamCommitWindowBytes > 0 {
+				tr.SetCommitBytes(streamCommitWindowBytes)
+			}
+			return tr, why
+		}
+	}
 	x.st = guard.New(&guard.Plan{
 		Tr:          plan.Tr,
 		Mode:        guard.Transform,
@@ -688,6 +698,7 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		OnCommit:    x.onCommit,
 		OnFinish:    x.onFinish,
 		EarlyCommit: x.earlyCommit,
+		Replan:      replan,
 		Fallback:    x.fallback,
 		Uncoverable: func(why string) {
 			_ = util.ErrorHandler("ai-proxy.stream_xform_uncoverable", fmt.Errorf("streaming transform bailed after commit: %s", why))
