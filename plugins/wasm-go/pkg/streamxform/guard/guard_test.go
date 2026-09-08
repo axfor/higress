@@ -183,8 +183,14 @@ func TestPrefixTransformEndOfStreamArrivesEmpty(t *testing.T) {
 		}
 		return m
 	}})
+	kept := 0
 	s := New(&Plan{Tr: tr, Mode: PrefixTransform,
 		OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen },
+		Metric: func(n string) {
+			if n == "prefix_kept_for_finish" {
+				kept++
+			}
+		},
 	})
 	// The exact split Envoy produced on the gateway: the first two chunks stay just under the 64KB commit
 	// point, so the third one crosses it and carries the closing brace at once.
@@ -202,6 +208,12 @@ func TestPrefixTransformEndOfStreamArrivesEmpty(t *testing.T) {
 	if string(out) != want {
 		t.Fatalf("body truncated: got %d bytes, want %d; tail %q vs %q",
 			len(out), len(want), tailOf(string(out)), tailOf(want))
+	}
+	if kept != 1 {
+		t.Fatalf("the branch that keeps the transformer for Finish should be counted once, got %d", kept)
+	}
+	if s.raw {
+		t.Fatal("the transformer must not have been dropped: the engine still held the tail")
 	}
 }
 
