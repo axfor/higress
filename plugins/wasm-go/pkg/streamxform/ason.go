@@ -50,6 +50,8 @@ const OutBufferSize = 128 << 10
 type (
 	// FieldTypes is the set of JSON types a root-level field may have.
 	FieldTypes = ason.FieldTypes
+	// FieldTree is the recursive form: what a value may be, and what its children may be.
+	FieldTree = ason.FieldTree
 )
 
 const (
@@ -64,6 +66,9 @@ const (
 var (
 	// FieldTypesOf derives the root-level field type table from the struct the buffered path unmarshals into.
 	FieldTypesOf = ason.FieldTypesOf
+	// FieldTreeOf derives the recursive form. Nothing consumes it yet: it is here so the evidence for nested
+	// checking can be built before the behaviour changes.
+	FieldTreeOf = ason.FieldTreeOf
 
 	NewTransformer = ason.NewTransformer
 	Pass           = ason.Pass

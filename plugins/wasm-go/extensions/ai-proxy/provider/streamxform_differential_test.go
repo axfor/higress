@@ -657,12 +657,11 @@ func TestFuzzDifferential(t *testing.T) {
 		if !ok {
 			offFail++
 			if sok {
-				// the only lenience allowed: the buffered struct fails type validation of a dropped field (an array inside metadata, say).
-				// Streaming does not read those fields and produces the same request the buffered path would with a valid value there.
-				// A type error in a field that is read (tools / stop / messages / ...) must fail in streaming as well.
+				// No lenience is allowed any more. The root-level type table and the field tree together
+				// reproduce the buffered struct's rejection surface, dropped fields included, so a request
+				// the buffered path refuses must be refused here too.
 				if isDiscardedFieldTypeError(oerr) {
 					lenient++
-					continue
 				}
 				t.Fatalf("case %d: buffered path failed but streaming passed (chunk=%d): %v\n  input: %s", i, chunk, oerr, in)
 			}

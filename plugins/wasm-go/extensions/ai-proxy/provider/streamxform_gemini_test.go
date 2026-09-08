@@ -181,8 +181,7 @@ func TestGeminiFuzz(t *testing.T) {
 			offFail++
 			if sok {
 				if isDiscardedFieldTypeErrorIn(oerr, geminiExtraDiscarded) {
-					lenient++ // type error in a dropped field: known lenient difference
-					continue
+					lenient++ // no longer allowed: the field tree covers dropped fields too
 				}
 				t.Fatalf("case %d: buffered path failed but streaming passed (chunk=%d): %v\n  input: %s", i, chunk, oerr, in)
 			}

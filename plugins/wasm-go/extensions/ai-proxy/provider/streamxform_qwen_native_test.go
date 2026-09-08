@@ -133,7 +133,6 @@ func TestQwenNativeFuzz(t *testing.T) {
 			if sok {
 				if isDiscardedFieldTypeErrorIn(oerr, qwenNativeExtraDiscarded) {
 					lenient++
-					continue
 				}
 				t.Fatalf("case %d: buffered path failed but streaming passed (chunk=%d): %v\n  input: %s", i, chunk, oerr, in)
 			}

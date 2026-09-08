@@ -342,6 +342,14 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 // cannot silently leave the streaming path more permissive than the buffered one.
 var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
 
+// chatRequestFieldTree is the recursive form. The root-level table catches a field of the wrong type; the tree
+// also catches a value of the wrong type inside a field whose own type is right ({"metadata":{"k":[1,2]}}
+// against map[string]string). On the corpus this struct really sees, the root table reproduces 16.8% of what
+// unmarshalling rejects and the tree reproduces all of it.
+//
+// Depth 6 covers chatCompletionRequest down to functionCall, which is as deep as it goes.
+var chatRequestFieldTree = streamxform.FieldTreeOf(&chatCompletionRequest{}, 6)
+
 // checkChatRequestTypes applies that table. It belongs only to the providers whose buffered path really does
 // decode into the struct -- claude, gemini and native qwen. The rest go through defaultTransformRequestBody,
 // which reads the body with gjson and type-checks nothing; adding the check there would make the streaming
@@ -349,6 +357,7 @@ var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
 func checkChatRequestTypes(p *StreamPlan) *StreamPlan {
 	if p != nil && p.Tr != nil && ChatRequestTypeCheck {
 		p.Tr.SetFieldTypes(chatRequestFieldTypes)
+		p.Tr.SetFieldTree(chatRequestFieldTree)
 	}
 	return p
 }
