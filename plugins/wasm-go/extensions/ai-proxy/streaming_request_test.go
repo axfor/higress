@@ -1002,3 +1002,49 @@ func TestStreamingRequest_Context(t *testing.T) {
 		}
 	})
 }
+
+// mergeConsecutiveMessages: the stage runs in front of the provider's conversion (claude) and, for Claude-protocol
+// input, between the conversion and the provider's transformer (openai). Consecutive user turns become one.
+func TestStreamingRequest_MergeConsecutive(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		big := strings.Repeat("g", 100000)
+		for _, c := range []struct {
+			name, cfg, endpoint, body string
+			check                     func(out map[string]any)
+		}{
+			{"claude", `{"provider":{"type":"claude","apiTokens":["sk-test"],"modelMapping":{"m":"claude-3"},"mergeConsecutiveMessages":true}}`,
+				"/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"first"},{"role":"user","content":"` + big + `"},{"role":"assistant","content":"a1"},{"role":"assistant","content":"a2"},{"role":"user","content":"last"}]}`,
+				func(out map[string]any) {
+					msgs := out["messages"].([]any)
+					require.Len(t, msgs, 3)
+					require.Equal(t, "first\n\n"+big, msgs[0].(map[string]any)["content"])
+					require.Equal(t, "a1\n\na2", msgs[1].(map[string]any)["content"])
+					require.Equal(t, "last", msgs[2].(map[string]any)["content"])
+				}},
+			{"hiclaw claude input", `{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"claude-3":"gpt-4o"},"hiclawMode":true}}`,
+				"/v1/messages", `{"model":"claude-3","system":"S","max_tokens":10,"messages":[{"role":"user","content":"u1"},{"role":"user","content":[{"type":"text","text":"` + big + `"}]},{"role":"assistant","content":"a"}]}`,
+				func(out map[string]any) {
+					msgs := out["messages"].([]any)
+					require.Len(t, msgs, 3)
+					require.Equal(t, "system", msgs[0].(map[string]any)["role"])
+					merged := msgs[1].(map[string]any)
+					require.Equal(t, "user", merged["role"])
+					// the conversion keeps a user's content blocks as an array, so the merge concatenates parts
+					require.Equal(t, []any{map[string]any{"type": "text", "text": "u1"}, map[string]any{"type": "text", "text": big}}, merged["content"])
+					require.Equal(t, "assistant", msgs[2].(map[string]any)["role"])
+				}},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(json.RawMessage(c.cfg))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status, c.name)
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders(c.endpoint))
+				actions, upstream := feedChunks(host, []byte(c.body), 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				var out map[string]any
+				require.NoError(t, json.Unmarshal(upstream, &out), "%s: %s", c.name, truncate(upstream))
+				c.check(out)
+			}()
+		}
+	})
+}

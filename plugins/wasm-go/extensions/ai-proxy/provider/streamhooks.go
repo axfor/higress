@@ -58,6 +58,9 @@ type StreamPlan struct {
 	// system message, the Claude conversion the system prefix). Chat requests under that setting on any other plan
 	// keep the buffered path.
 	ContextHandled bool
+	// MergeHandled: the plan already placed the mergeConsecutiveMessages stage where the buffered path runs it
+	// (between the Claude-input conversion and the provider's transformer); other chat plans get it in front.
+	MergeHandled bool
 }
 
 // streamDefaultProviders are the providers that go through defaultTransformRequestBody
@@ -78,6 +81,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	if plan == nil {
 		return nil, why
 	}
+	plan = c.withMerge(plan, apiName)
 	plan, why = c.withFirstByteTimeout(plan, apiName)
 	if plan == nil {
 		return nil, why
@@ -87,6 +91,28 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return nil, why
 	}
 	return c.withContext(plan, apiName)
+}
+
+// withMerge reproduces handleRequestBody's mergeConsecutiveMessages on chat: a stage in front of the provider's
+// transformer (the Claude-input plan places it itself, after the conversion). The buffered path skips it under
+// the original protocol, where the plan is a passthrough.
+func (c *ProviderConfig) withMerge(p *StreamPlan, apiName ApiName) *StreamPlan {
+	if !c.mergeConsecutiveMessages || apiName != ApiNameChatCompletion || p.MergeHandled || p.Passthrough || p.Tr == nil {
+		return p
+	}
+	p.Tr = streamxform.NewPipeline(streamxform.NewMergeConsecutive(), p.Tr)
+	if p.Replan != nil {
+		inner := p.Replan
+		p.Replan = func(pre streamxform.Prelude) (streamxform.Xform, string) {
+			tr, why := inner(pre)
+			if tr == nil {
+				return nil, why
+			}
+			return streamxform.NewPipeline(streamxform.NewMergeConsecutive(), tr), ""
+		}
+	}
+	p.MergeHandled = true
+	return p
 }
 
 // withContext reproduces handleRequestBody's handling of the setting `context` on chat: the file content is
@@ -249,9 +275,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	}
 	if len(c.contextCleanupCommands) > 0 {
 		return nil, "contextCleanupCommands"
-	}
-	if c.mergeConsecutiveMessages {
-		return nil, "mergeConsecutiveMessages"
 	}
 	if c.IsRetryOnFailureEnabled() {
 		return nil, "retryOnFailure needs the whole body stored in the context"
@@ -959,7 +982,11 @@ func (c *ProviderConfig) claudeInputPlan(ctx wrapper.HttpContext, apiName ApiNam
 		ResponseFormat:         c.streamResponseFormat(),
 		InsertSystem:           c.streamContextContent(),
 	})
-	return &StreamPlan{Tr: streamxform.NewPipeline(first, second), ApplyStream: true, ApplyModel: true, ContextHandled: true}, ""
+	var tail streamxform.Xform = second
+	if c.mergeConsecutiveMessages { // handleRequestBody merges after the conversion and before the provider's transform
+		tail = streamxform.NewPipeline(streamxform.NewMergeConsecutive(), second)
+	}
+	return &StreamPlan{Tr: streamxform.NewPipeline(first, tail), ApplyStream: true, ApplyModel: true, ContextHandled: true, MergeHandled: true}, ""
 }
 
 // streamResponseFormat is the configured responseJsonSchema as the openai / longcat TransformRequestBody sets it
