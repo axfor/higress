@@ -46,7 +46,7 @@ Nothing is sent upstream before the first 64KB has been read; a request that tur
 
 Operational note: the streaming path opens the upstream connection once 64KB has been read, so a slowly uploading client keeps the upstream connection busy for longer than with full buffering; size upstream request/idle timeouts for upload time plus generation time.
 
-Known differences from the buffered path (all "more lenient", never producing a semantically different valid request): the buffered path type-checks the whole body against its structs and returns 500 on any mismatch, while the streaming path validates only the fields it reads and passes the rest through byte-for-byte for the provider to judge. When `stream` appears after the first 64KB, the `Accept: text/event-stream` header is no longer rewritten (providers decide streaming by the body field).
+Type checking matches the buffered path: the streaming path validates root and nested fields against a type tree derived from the request struct, so it rejects exactly the documents the struct decode would (`streamTypeCheck: false` turns it off). The one known difference from the buffered path: when `stream` appears after the first 64KB, the `Accept: text/event-stream` header is no longer rewritten (providers decide streaming by the body field).
 
 ## Execution Properties
 Plugin execution phase: `Default Phase`
@@ -60,6 +60,16 @@ Plugin execution priority: `100`
 | Name       | Data Type   | Requirement | Default | Description               |
 |------------|--------|------|-----|------------------|
 | `provider` | object | Required   | -   | Configures information for the target AI service provider |
+
+Tuning fields for the streaming transform (top level, next to `provider`; normally left unset):
+
+| Name                        | Data Type | Requirement | Default  | Description |
+| --------------------------- | --------- | ----------- | -------- | ----------- |
+| `streamCommitWindowBytes`   | number    | optional    | 65536    | Commit window. Nothing is sent upstream before this many bytes have been read, and a body of at most this size behaves byte for byte like the buffered path; a larger window widens that compatibility boundary and raises what each in-flight request holds. Range 4096–1048576 |
+| `streamTypeCheck`           | bool      | optional    | true     | Type-check the body against the type tree derived from the request struct, matching the buffered path's rejection surface. Off, only the fields the transform reads are checked |
+| `streamInflightBudgetBytes` | number    | optional    | 33554432 | Byte budget for the streaming uploads in flight per wasm VM; the admission limit is budget / window (512 by default). Past it a body of at most 2 × window is diverted to the buffered path, a larger one is still streamed because buffering it would hold more. Range 1MB–1GB |
+| `streamGcFloorBytes`        | number    | optional    | 67108864 | Heap threshold of the wasm-go GC watchdog: a forced collection runs once the heap exceeds it while the runtime's own GC is not triggering. Range 8MB–512MB |
+| `streamEarlyCommit`         | bool      | optional    | false    | Commit as soon as the request headers no longer depend on anything still to come (`model`, plus `stream` where the path or a required header depends on it); the window then only bounds requests where that never happens. Holds less per in-flight request but gives up the "≤ window behaves like the buffered path" guarantee: an unsupported shape met after the commit returns 500 instead of falling back, and `Accept` is not rewritten when `stream` trails the chunk that carried `model` |
 
 **Details for the `provider` configuration fields:**
 
