@@ -251,3 +251,80 @@ func TestSettingsBeforeClaude(t *testing.T) {
 		}
 	}
 }
+
+// responseJsonSchema (openai / longcat): the configured schema replaces the request's response_format. The buffered
+// TransformRequestBody sets it on the decoded struct and re-serialises the request, so both outputs are compared
+// after that round trip: the streaming output differs from it only by what the struct would have dropped.
+func TestResponseJsonSchemaDifferential(t *testing.T) {
+	schema := map[string]interface{}{"type": "json_schema", "json_schema": map[string]interface{}{"name": "answer", "schema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"a": map[string]interface{}{"type": "string"}}}}}
+	cfg := ProviderConfig{typ: providerTypeOpenAI, responseJsonSchema: schema, modelMapping: oaiMapping}
+	official := func(in string) (map[string]any, bool) {
+		req := &chatCompletionRequest{}
+		if err := decodeChatCompletionRequest([]byte(in), req); err != nil {
+			return nil, false
+		}
+		req.ResponseFormat = schema
+		b, _ := json.Marshal(req)
+		return officialOpenAI(string(b), oaiMapping, true)
+	}
+	roundTrip := func(m map[string]any) map[string]any {
+		b, _ := json.Marshal(m)
+		req := &chatCompletionRequest{}
+		require.NoError(t, json.Unmarshal(b, req))
+		b, _ = json.Marshal(req)
+		out, err := decodeMap(b)
+		require.NoError(t, err)
+		return out
+	}
+	rf := cfg.streamResponseFormat()
+	require.NotNil(t, rf)
+	for _, in := range []string{
+		`{"model":"m1","messages":[{"role":"user","content":"U"}]}`,
+		`{"model":"m1","response_format":{"type":"text"},"messages":[{"role":"user","content":"U"}]}`,
+		`{"response_format":{"type":"json_object"},"model":"m1","stream":true,"messages":[{"role":"user","content":"U"}],"max_tokens":9}`,
+		`{"model":"m1","messages":[{"role":"user","content":"U"}],"response_format":null}`,
+		`{"model":"m1","messages":[{"role":"user","content":"` + strings.Repeat("r", 70000) + `"}],"response_format":{"type":"text"},"temperature":0.5}`,
+		`{"model":"m1","messages":[{"role":"system","content":"D"},{"role":"user","content":"U"}],"stream":true,"stream_options":{"include_usage":true}}`,
+		`{"model":"m1","messages":[{"role":"user","content":"U"}],"response_format":"bad"}`,
+	} {
+		off, offOK := official(in)
+		for _, chunk := range []int{1, 7, 4096} {
+			tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{
+				MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
+				DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeOpenAI), CheckMessages: true, ResponseFormat: rf,
+			})
+			tr.SetFieldTree(chatRequestFieldTree)
+			str, ok, why := runStream(tr, in, chunk)
+			if !offOK {
+				require.False(t, ok, "chunk=%d: buffered failed but streaming passed\n  %s", chunk, in)
+				continue
+			}
+			require.True(t, ok, "chunk=%d unexpected fallback: %s\n  %s", chunk, why, in)
+			require.Equal(t, schema["type"], str["response_format"].(map[string]any)["type"], in)
+			require.Empty(t, diffMaps(off, roundTrip(str)), "chunk=%d\n  %s", chunk, in)
+		}
+	}
+}
+
+// The one visible effect of the buffered round trip: stream_options.include_usage false is dropped by omitempty and
+// then re-added as true by normalizeOpenAiRequestBody. Streaming keeps the request's false. Pinned as a deviation.
+func TestResponseJsonSchemaIncludeUsageDeviation(t *testing.T) {
+	schema := map[string]interface{}{"type": "json_object"}
+	cfg := ProviderConfig{typ: providerTypeLongcat, responseJsonSchema: schema, modelMapping: oaiMapping}
+	in := `{"model":"m1","messages":[{"role":"user","content":"U"}],"stream":true,"stream_options":{"include_usage":false}}`
+	req := &chatCompletionRequest{}
+	require.NoError(t, decodeChatCompletionRequest([]byte(in), req))
+	req.ResponseFormat = schema
+	b, _ := json.Marshal(req)
+	off, ok := officialOpenAI(string(b), oaiMapping, true)
+	require.True(t, ok)
+	require.Equal(t, map[string]any{"include_usage": true}, off["stream_options"])
+	tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{
+		MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
+		DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeLongcat), CheckMessages: true, ResponseFormat: cfg.streamResponseFormat(),
+	})
+	str, ok, why := runStream(tr, in, 7)
+	require.True(t, ok, why)
+	require.Equal(t, map[string]any{"include_usage": false}, str["stream_options"])
+	require.Equal(t, "json_object", str["response_format"].(map[string]any)["type"])
+}

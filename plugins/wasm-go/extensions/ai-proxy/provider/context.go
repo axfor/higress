@@ -26,6 +26,10 @@ type ContextConfig struct {
 	servicePort int64 `required:"true" yaml:"servicePort" json:"servicePort"`
 
 	fileUrlObj *url.URL `yaml:"-"`
+
+	// cache is the provider's contextCache, kept here so that the streaming plan (which only has the config)
+	// can read the cached file content; the provider owns the fetch.
+	cache *contextCache `yaml:"-"`
 }
 
 func (c *ContextConfig) FromJson(json gjson.Result) {
@@ -100,11 +104,13 @@ func createContextCache(providerConfig *ProviderConfig) *contextCache {
 		Port: contextConfig.servicePort,
 		Host: fileUrlObj.Host,
 	}
-	return &contextCache{
+	cache := &contextCache{
 		client:  wrapper.NewClusterClient(cluster),
 		fileUrl: fileUrlObj,
 		timeout: providerConfig.timeout,
 	}
+	contextConfig.cache = cache
+	return cache
 }
 
 func (c *contextCache) GetContextFromFile(ctx wrapper.HttpContext, provider Provider, body []byte) error {

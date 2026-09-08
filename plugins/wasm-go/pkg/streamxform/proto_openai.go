@@ -27,6 +27,16 @@ type OpenAIOptions struct {
 	DeveloperRoleSupported bool
 	// CheckMessages: only chat needs to enter messages and check role.
 	CheckMessages bool
+	// ResponseFormat, when set, replaces the request's response_format with this raw JSON (the configured
+	// responseJsonSchema of the openai / longcat providers). The buffered path sets it on the decoded struct and
+	// re-serialises the whole request; that incidental round trip (fields the struct lacks and zero-valued optional
+	// fields dropped) is not reproduced, the rest of the request passes through.
+	ResponseFormat []byte
+	// InsertSystem, when set, is the content of the system message the buffered defaultInsertHttpContextMessage
+	// adds for the setting `context` (the file's text): placed before the first message whose role is not system,
+	// or as the only message when there are none. The buffered path puts it first when every message is system;
+	// streaming has already released those, so there it goes last -- the one documented deviation.
+	InsertSystem *string
 	// Variant: provider-specific logic; nil = pure default path.
 	Variant OpenAIVariant
 }
@@ -62,6 +72,11 @@ type openaiProto struct {
 	scanReasoning  bool
 	msgRCSeen      bool     // reasoning_content already seen in the current message (gjson only looks at the first)
 	movedTop       []string // top-level keys Captured and moved to the end: a second occurrence cannot keep the last-wins order
+
+	// InsertSystem: until the context message is placed, each message's keys wait for its role
+	ctxInserted bool
+	ctxRoleSeen bool
+	msgsSeen    bool
 }
 
 // NewOpenAI builds the transformer of the OpenAI-compatible passthrough protocol.
@@ -83,7 +98,23 @@ func (p *openaiProto) Prelude() Prelude {
 }
 
 func (p *openaiProto) enterMessages() bool {
-	return (p.opt.CheckMessages && !p.opt.DeveloperRoleSupported) || p.scanReasoning
+	return (p.opt.CheckMessages && !p.opt.DeveloperRoleSupported) || p.scanReasoning || p.opt.InsertSystem != nil
+}
+
+// contextMessage is the system message the setting `context` inserts.
+func (p *openaiProto) contextMessage() []byte {
+	b := []byte(`{"role":"system","content":`)
+	b = appendJSONString(b, *p.opt.InsertSystem)
+	return append(b, '}')
+}
+
+// insertContextBefore writes the context message as the element preceding the message being scanned, whose
+// own output level has not opened yet (its keys are all deferred or captured).
+func (p *openaiProto) insertContextBefore(t *Transformer) {
+	w := t.W()
+	w.ElemAt(w.Level() - 1)
+	w.Raw(p.contextMessage())
+	p.ctxInserted = true
 }
 
 // moved records a top-level key that was moved to the end of the output.
@@ -116,6 +147,11 @@ func (p *openaiProto) OnKey(t *Transformer) Action {
 				return Pass() // sjson only rewrites the first
 			}
 			return Capture(4 << 10)
+		case "response_format":
+			if p.opt.ResponseFormat != nil {
+				return Skip() // replaced, written at the end
+			}
+			return Pass()
 		case "stream":
 			// the side effects (Accept / isStreaming) need DetectStream, the include_usage decision needs NormalizeUsage;
 			// either of them means the value of stream has to be looked at.
@@ -130,7 +166,8 @@ func (p *openaiProto) OnKey(t *Transformer) Action {
 			return p.moved(t, k, Capture(16<<10))
 		case "messages":
 			if p.enterMessages() {
-				if p.scanReasoning {
+				p.msgsSeen = true
+				if p.scanReasoning || p.opt.InsertSystem != nil {
 					return Probe() // gjson's Array() has special semantics for non-arrays: fall back on those
 				}
 				return Enter().Lenient()
@@ -139,6 +176,13 @@ func (p *openaiProto) OnKey(t *Transformer) Action {
 		}
 		return Pass()
 	case 3:
+		if p.opt.InsertSystem != nil && !p.ctxInserted && !p.ctxRoleSeen {
+			// nothing of this message may go out before its role decides whether the context message precedes it
+			if t.Last() == "role" {
+				return Capture(256)
+			}
+			return Defer(roleWaitCap)
+		}
 		switch t.Last() {
 		case "role":
 			if p.opt.CheckMessages && !p.opt.DeveloperRoleSupported {
@@ -158,6 +202,10 @@ func (p *openaiProto) OnKey(t *Transformer) Action {
 func (p *openaiProto) OnElem(t *Transformer) Action {
 	if t.Depth() == 2 {
 		p.msgRCSeen = false
+		p.ctxRoleSeen = false
+		if p.opt.InsertSystem != nil && !p.ctxInserted {
+			return Probe() // the buffered decode fails on an element that is not an object
+		}
 		return Enter().Lenient()
 	}
 	return Pass()
@@ -165,7 +213,16 @@ func (p *openaiProto) OnElem(t *Transformer) Action {
 
 func (p *openaiProto) OnStart(t *Transformer, kind ValueKind) Action {
 	switch t.Depth() {
+	case 2: // a message, while the context message is still to be placed
+		if kind != KindObject {
+			return Bail("message is not an object, the buffered decode fails")
+		}
+		return Enter()
 	case 1: // messages
+		if kind == KindNull && p.opt.InsertSystem != nil {
+			p.msgsSeen = false // decoded as no messages: the context message becomes the only one, written at the end
+			return Skip()
+		}
 		if kind != KindArray {
 			return Bail("messages is not an array, gjson Array() semantics not reproduced")
 		}
@@ -224,8 +281,26 @@ func (p *openaiProto) OnValue(t *Transformer, raw []byte) {
 	case 3:
 		switch t.Last() {
 		case "role":
-			if s, ok := jsonUnquote(raw); ok && s == "developer" {
+			s, ok := jsonUnquote(raw)
+			if ok && s == "developer" && !p.opt.DeveloperRoleSupported {
 				t.Bail("developer role: the buffered path re-serializes the whole request through a struct, not reproduced by streaming")
+				return
+			}
+			if p.opt.InsertSystem != nil && !p.ctxInserted && !p.ctxRoleSeen {
+				// the role was captured: the context message goes in front of the first message that is not system,
+				// then the role and the keys held before it are written
+				if !ok && string(raw) != "null" {
+					t.Bail("role is not a string, the buffered decode fails")
+					return
+				}
+				p.ctxRoleSeen = true
+				if s != "system" { // null decodes to "" on the buffered path: not system
+					p.insertContextBefore(t)
+				}
+				w := t.W()
+				w.KeyRaw(t.KeyRaw())
+				w.Raw(raw)
+				t.Release()
 			}
 		case "reasoning_content":
 			if string(raw) != "null" {
@@ -246,7 +321,23 @@ func (p *openaiProto) OnPrefix(t *Transformer, raw []byte, complete bool) (Actio
 	return Bail("unexpected Prefix: " + t.PathString()), 0
 }
 
-func (p *openaiProto) OnLeave(t *Transformer) {}
+func (p *openaiProto) OnLeave(t *Transformer) {
+	if p.opt.InsertSystem == nil || p.ctxInserted {
+		return
+	}
+	w := t.W()
+	switch t.Depth() {
+	case 2: // a message without a role: "" is not system, so the context message precedes it
+		if !p.ctxRoleSeen {
+			p.insertContextBefore(t)
+			t.ReleaseNow()
+		}
+	case 1: // every message was system (or there were none): appended, where the buffered path prepends
+		w.Elem()
+		w.Raw(p.contextMessage())
+		p.ctxInserted = true
+	}
+}
 
 func (p *openaiProto) Tail(t *Transformer) {
 	w := t.W()
@@ -254,6 +345,17 @@ func (p *openaiProto) Tail(t *Transformer) {
 		// sjson.SetBytes adds a model when it is missing (the result of mapping the empty string)
 		w.Key("model")
 		w.JSONString(p.opt.MapModel(""))
+	}
+	if p.opt.ResponseFormat != nil {
+		w.Key("response_format")
+		w.Raw(p.opt.ResponseFormat)
+	}
+	if p.opt.InsertSystem != nil && !p.ctxInserted {
+		w.Key("messages") // absent or null: the context message is the only one
+		w.Byte('[')
+		w.Raw(p.contextMessage())
+		w.Byte(']')
+		p.ctxInserted = true
 	}
 	if p.opt.Variant != nil {
 		p.opt.Variant.Tail(t, &p.st)

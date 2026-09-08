@@ -57,10 +57,12 @@ description: AI 代理插件配置参考
 - `kling` 的 `/v1/videos`（body 原样，`model` 映射进 `model_name`；路径由是否带图片输入字段决定，body 超过窗口且尚未见到图片字段时回落）；
 - vertex 的 chat（OpenAI → Anthropic 格式或 Vertex 自己的 Gemini 格式，按映射后的模型选择）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内。Gemini 格式下 assistant 消息的内容要等 `tool_calls` 到齐（超过 1MB 回落），含 http(s) 图片链接的 URL 须在 8KB 内。
 - `customSettings`：作为管道的第一段跑在供应商转换之前（全量路径也是先改 body 再交 handler）；覆盖型设置在所在容器一开始就写出（请求里原有的值丢弃），填充型设置等容器结束、确认缺失后写出，中间缺的对象按 sjson 的方式补出来；路径只支持点分的普通键（数组下标、转义、通配等 gjson 语法回落），路径中途遇到数组回落（sjson 在那里报错）。
+- `responseJsonSchema`（openai / longcat）：配置的 schema 替换请求里的 `response_format`；全量路径顺带把整个请求经结构体重新序列化一遍（不认识的字段、零值的可选字段会被丢掉，`stream_options.include_usage: false` 会变成 true），流式不复刻这一步，其余原样透传。
+- `context`：文件内容已缓存（第一个请求走全量路径取文件）后，chat 请求流式插入：OpenAI 形态的 body（openai 兼容族、azure、qwen 兼容、zhipuai、openrouter、minimax v2、vertex OpenAI 兼容端点、Claude 协议入站转换后）在第一条非 system 消息之前插入 system 消息，为此每条消息在 role 到来之前的键有界暂存（64KB）；claude 把内容接在 system 前面（`内容\n原 system`）。偏差：全部消息都是 system 时全量路径把它放在最前，流式已放行这些消息、只能追加在最后；请求没有 system 消息时全量路径的 claude 插入会空指针崩溃，流式把内容作为 system。其它 body 形态（gemini、vertex Gemini 格式、bedrock 等）的 chat 仍走全量路径。
 
 其余供应商（AK/SK 模式的 Bedrock、Hunyuan）以及配置了
-`context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
-`responseJsonSchema` / `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
+`contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
+`qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 `firstByteTimeout` 在 chat 上照常生效（`stream` 须出现在窗口内，否则回落），`providerBasePath` 对所有供应商照常生效。
 
 运行指标：`ai_proxy.stream_xform.streamed` / `fallback` / `uncoverable` / `skipped` 四个计数器（Envoy 统计里带 `wasmcustom.` 前缀）（走流式 / 回落到全量 /

@@ -34,6 +34,10 @@ type ClaudeOptions struct {
 	// runs convertDeveloperRoleToSystem before decoding, so developer normally means system; Vertex's own request
 	// handler skips that step and hands the role to Claude as it came.
 	KeepDeveloperRole bool
+	// ContextPrefix, when set, is the file content the setting `context` puts in front of system, as the claude
+	// provider's insertHttpContextMessage does after the conversion: system becomes the content alone, or the
+	// content, a newline and the system text (an array's text blocks joined by newlines) -- always a plain string.
+	ContextPrefix *string
 }
 
 const (
@@ -844,7 +848,10 @@ func (p *claudeProto) Tail(t *Transformer) {
 		w.RawString("null") // buffered nil slice
 	}
 	// system
-	if p.opt.ClaudeCodeMode {
+	if p.opt.ContextPrefix != nil {
+		w.Key("system")
+		w.JSONString(p.contextSystem())
+	} else if p.opt.ClaudeCodeMode {
 		w.Key("system")
 		w.RawString(`[{"type":"text"`)
 		switch {
@@ -1092,4 +1099,22 @@ func atoi(b []byte) int {
 		return -n
 	}
 	return n
+}
+
+// contextSystem reproduces claudeProvider.insertHttpContextMessage on the request this protocol would have built:
+// the system text the buffered request carries (claudeSystemPrompt.String()), with the context in front.
+func (p *claudeProto) contextSystem() string {
+	var sys string
+	switch {
+	case p.opt.ClaudeCodeMode && !p.sysSeen:
+		sys = claudeCodeSystemPrompt
+	case p.sysRaw != nil:
+		sys, _ = jsonUnquote(p.sysRaw)
+	default:
+		sys = p.sys
+	}
+	if sys == "" {
+		return *p.opt.ContextPrefix
+	}
+	return *p.opt.ContextPrefix + "\n" + sys
 }

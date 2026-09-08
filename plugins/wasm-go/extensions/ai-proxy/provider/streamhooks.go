@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -53,6 +54,10 @@ type StreamPlan struct {
 	// model (Vertex: a claude-prefixed model takes the Anthropic format, anything else the Gemini one). Tr is then only
 	// a probe for model. See guard.Plan.Replan.
 	Replan func(pre streamxform.Prelude) (streamxform.Xform, string)
+	// ContextHandled: the plan's transformer inserts the setting `context` itself (an OpenAI-shaped body gets the
+	// system message, the Claude conversion the system prefix). Chat requests under that setting on any other plan
+	// keep the buffered path.
+	ContextHandled bool
 }
 
 // streamDefaultProviders are the providers that go through defaultTransformRequestBody
@@ -77,7 +82,36 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	if plan == nil {
 		return nil, why
 	}
-	return c.withCustomSettings(plan)
+	plan, why = c.withCustomSettings(plan)
+	if plan == nil {
+		return nil, why
+	}
+	return c.withContext(plan, apiName)
+}
+
+// withContext reproduces handleRequestBody's handling of the setting `context` on chat: the file content is
+// inserted into the transformed body, by the plans that know their body shape (ContextHandled). The buffered
+// path fetches the file once and caches it; until it is cached the request takes that path.
+func (c *ProviderConfig) withContext(p *StreamPlan, apiName ApiName) (*StreamPlan, string) {
+	if c.context == nil || apiName != ApiNameChatCompletion {
+		return p, ""
+	}
+	if !p.ContextHandled {
+		return nil, "context insertion on this provider's body shape keeps the buffered path"
+	}
+	if c.streamContextContent() == nil {
+		return nil, "context file not cached yet, the buffered path fetches it"
+	}
+	return p, ""
+}
+
+// streamContextContent is the cached content of the context file, nil while it is not loaded (or not configured).
+func (c *ProviderConfig) streamContextContent() *string {
+	if c.context == nil || c.context.cache == nil || !c.context.cache.loaded {
+		return nil
+	}
+	content := c.context.cache.content
+	return &content
 }
 
 // withCustomSettings reproduces main.go's ReplaceByCustomSettings, which rewrites the body before any handler
@@ -213,9 +247,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		return &StreamPlan{Passthrough: true}, ""
 	}
-	if c.context != nil {
-		return nil, "context injection needs the whole body"
-	}
 	if len(c.contextCleanupCommands) > 0 {
 		return nil, "contextCleanupCommands"
 	}
@@ -242,6 +273,10 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	detectStream := isChat || apiName == ApiNameVideos || apiName == ApiNameVideoRemix
 	mapLenient := func(m string) string { return getMappedModel(m, c.modelMapping) }
 	normalize := c.IsOpenAIProtocol() && !c.IsGeneric() && (isChat || apiName == ApiNameCompletion) && !c.disableStreamUsageStats
+	var insertSystem *string // the setting `context` on chat: defaultInsertHttpContextMessage on the OpenAI-shaped body
+	if isChat {
+		insertSystem = c.streamContextContent()
+	}
 	defaultOpts := func(v streamxform.OpenAIVariant) streamxform.OpenAIOptions {
 		return streamxform.OpenAIOptions{
 			MapModel:               mapLenient,
@@ -249,11 +284,13 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			NormalizeUsage:         normalize,
 			DeveloperRoleSupported: isDeveloperRoleSupported(c.typ),
 			CheckMessages:          isChat,
+			ResponseFormat:         c.streamResponseFormat(),
+			InsertSystem:           insertSystem,
 			Variant:                v,
 		}
 	}
 	defaultPlan := func(v streamxform.OpenAIVariant) *StreamPlan {
-		return &StreamPlan{Tr: streamxform.NewOpenAI(defaultOpts(v)), ApplyStream: detectStream, ApplyModel: true}
+		return &StreamPlan{Tr: streamxform.NewOpenAI(defaultOpts(v)), ApplyStream: detectStream, ApplyModel: true, ContextHandled: isChat}
 	}
 	// among the providers on the default path, these endpoint kinds are handled separately by the buffered path
 	inDefaultApis := true
@@ -279,7 +316,8 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 				return mapped, nil
 			},
 			ClaudeCodeMode: c.claudeCodeMode,
-		}), ApplyStream: true, ApplyModel: true}), ""
+			ContextPrefix:  insertSystem, // claudeProvider.insertHttpContextMessage: the content in front of system
+		}), ApplyStream: true, ApplyModel: true, ContextHandled: true}), ""
 
 	case c.typ == providerTypeQwen && !c.qwenEnableCompatible && apiName == ApiNameEmbeddings:
 		// onEmbeddingsRequestBody: parseRequestAndMapModel and buildQwenTextEmbeddingRequest; the path is header-phase
@@ -348,7 +386,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		opts := defaultOpts(&streamxform.QwenVariant{SupportsPreserveThinking: qwenSupportsPreserveThinking})
 		opts.ModelOnlyIfPresent = true
 		opts.DetectStream = c.firstByteTimeout != 0 // no Accept / isStreaming on this branch; stream is only observed for the first-byte timeout
-		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}, ""
+		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false, ContextHandled: isChat}, ""
 
 	case c.typ == providerTypeMinimax && c.minimaxApiType == minimaxApiTypePro && isChat:
 		// handleRequestBodyByChatCompletionPro: the request is rebuilt (system → bot_setting, user / assistant →
@@ -402,7 +440,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		opts := defaultOpts(nil)
 		opts.DetectStream = c.firstByteTimeout != 0 // neither Accept / isStreaming nor the model context keys on this branch
-		p := &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}
+		p := &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false, ContextHandled: true}
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			// the buffered path only switches to the v2 endpoint in the body phase (not in the header phase); the path is fixed and independent of body fields
 			if err := util.OverwriteRequestPath(c.bodyPhasePath(minimaxChatCompletionV2Path)); err != nil {
@@ -609,7 +647,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		opts.NormalizeUsage = false
 		opts.CheckMessages = false
 		opts.DeveloperRoleSupported = true
-		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true})
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true, ContextHandled: true})
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			ctx.SetContext(contextOpenAICompatibleMarker, true)
 			if err := util.OverwriteRequestPath(vp.getOpenAICompatibleRequestPath()); err != nil {
@@ -800,9 +838,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return p, ""
 
 	case c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat || c.typ == providerTypeDoubao || streamDefaultProviders[c.typ]:
-		if (c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat) && c.responseJsonSchema != nil {
-			return nil, "responseJsonSchema is re-serialized through a struct"
-		}
 		if !inDefaultApis {
 			return nil, "the default path of this apiName is not covered by streaming"
 		}
@@ -908,9 +943,6 @@ func (c *ProviderConfig) claudeInputPlan(ctx wrapper.HttpContext, apiName ApiNam
 	if !(c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat || c.typ == providerTypeDoubao || streamDefaultProviders[c.typ]) {
 		return nil, "automatic conversion of Claude protocol input for a provider with its own conversion"
 	}
-	if (c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat) && c.responseJsonSchema != nil {
-		return nil, "responseJsonSchema is re-serialized through a struct"
-	}
 	first := streamxform.NewClaudeToOpenAI(streamxform.ClaudeToOpenAIOptions{
 		PreserveReasoning:       c.supportsMessageReasoningContent(),
 		DisableStreamUsageStats: c.disableStreamUsageStats,
@@ -924,8 +956,23 @@ func (c *ProviderConfig) claudeInputPlan(ctx wrapper.HttpContext, apiName ApiNam
 		NormalizeUsage:         c.IsOpenAIProtocol() && !c.disableStreamUsageStats,
 		DeveloperRoleSupported: isDeveloperRoleSupported(c.typ),
 		CheckMessages:          true,
+		ResponseFormat:         c.streamResponseFormat(),
+		InsertSystem:           c.streamContextContent(),
 	})
-	return &StreamPlan{Tr: streamxform.NewPipeline(first, second), ApplyStream: true, ApplyModel: true}, ""
+	return &StreamPlan{Tr: streamxform.NewPipeline(first, second), ApplyStream: true, ApplyModel: true, ContextHandled: true}, ""
+}
+
+// streamResponseFormat is the configured responseJsonSchema as the openai / longcat TransformRequestBody sets it
+// on the request (only those two providers read the setting), nil for everyone else.
+func (c *ProviderConfig) streamResponseFormat() []byte {
+	if c.responseJsonSchema == nil || !(c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat) {
+		return nil
+	}
+	b, err := json.Marshal(c.responseJsonSchema)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // bodyPhasePath reproduces what handleRequestBody does to a path a TransformRequestBodyHeaders handler set: the

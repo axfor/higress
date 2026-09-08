@@ -918,3 +918,87 @@ func TestStreamingRequest_CustomSettingsFallback(t *testing.T) {
 		require.Equal(t, []any{"END"}, out["stop_sequences"])
 	})
 }
+
+// responseJsonSchema (openai / longcat): the configured schema replaces response_format, on the chat plan and behind
+// the Claude-input conversion alike. The buffered path's incidental struct round trip is not reproduced (see the
+// provider tests for the one visible difference).
+func TestStreamingRequest_ResponseJsonSchema(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		const cfg = `{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"claude-3":"gpt-4o","m":"gpt-4o"},"responseJsonSchema":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}}}`
+		big := strings.Repeat("j", 100000)
+		for _, c := range []struct{ name, endpoint, body string }{
+			{"chat", "/v1/chat/completions", `{"model":"m","response_format":{"type":"text"},"messages":[{"role":"user","content":"` + big + `"}],"stream":true}`},
+			{"claude input", "/v1/messages", `{"model":"claude-3","system":"S","max_tokens":10,"messages":[{"role":"user","content":"` + big + `"}]}`},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(json.RawMessage(cfg))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status, c.name)
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders(c.endpoint))
+				actions, upstream := feedChunks(host, []byte(c.body), 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				var out map[string]any
+				require.NoError(t, json.Unmarshal(upstream, &out), "%s: %s", c.name, truncate(upstream))
+				require.Equal(t, "json_schema", out["response_format"].(map[string]any)["type"], c.name)
+				require.Equal(t, "answer", out["response_format"].(map[string]any)["json_schema"].(map[string]any)["name"], c.name)
+				require.Equal(t, "gpt-4o", out["model"], c.name)
+				require.Equal(t, "/v1/chat/completions", requestHeader(host, ":path"), c.name)
+			}()
+		}
+	})
+}
+
+// The setting `context`: the first request takes the buffered path, which fetches the file and caches it; from then
+// on chat requests stream with the file's system message inserted before the first non-system message (openai) or
+// in front of system (claude).
+func TestStreamingRequest_Context(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		const ctxCfg = `,"context":{"fileUrl":"http://ctxfile/context.txt","serviceName":"ctxfile.default.svc.cluster.local","servicePort":80}`
+		const fileContent = "Context from the file."
+		big := strings.Repeat("x", 100000)
+		for _, c := range []struct {
+			name, cfg string
+			check     func(out map[string]any)
+		}{
+			{"openai", `{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"m":"gpt-4o"}` + ctxCfg + `}}`, func(out map[string]any) {
+				msgs := out["messages"].([]any)
+				require.Len(t, msgs, 3)
+				require.Equal(t, "S", msgs[0].(map[string]any)["content"])
+				require.Equal(t, map[string]any{"role": "system", "content": fileContent}, msgs[1])
+				require.Equal(t, "user", msgs[2].(map[string]any)["role"])
+			}},
+			{"claude", `{"provider":{"type":"claude","apiTokens":["sk-test"],"modelMapping":{"m":"claude-3"}` + ctxCfg + `}}`, func(out map[string]any) {
+				require.Equal(t, fileContent+"\nS", out["system"])
+				require.Len(t, out["messages"].([]any), 1)
+			}},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(json.RawMessage(c.cfg))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status, c.name)
+				body := `{"model":"m","messages":[{"role":"system","content":"S"},{"role":"user","content":"` + big + `"}]}`
+
+				// first request: buffered, fetches the file
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+				actions, _ := feedChunks(host, []byte(body), 4096)
+				require.Equal(t, types.ActionPause, actions[len(actions)-1], "%s: the buffered path waits for the file", c.name)
+				require.Len(t, host.GetHttpCalloutAttributes(), 1, c.name)
+				host.CallOnHttpCall([][2]string{{":status", "200"}}, []byte(fileContent))
+				var out map[string]any
+				require.NoError(t, json.Unmarshal(host.GetRequestBody(), &out), "%s: %s", c.name, truncate(host.GetRequestBody()))
+				c.check(out)
+				host.CompleteHttp()
+
+				// second request: the file is cached, the request streams
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+				actions, upstream := feedChunks(host, []byte(body), 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-2], "%s: released past the window", c.name)
+				require.Empty(t, host.GetHttpCalloutAttributes(), "%s: no second fetch", c.name)
+				out = nil
+				require.NoError(t, json.Unmarshal(upstream, &out), "%s: %s", c.name, truncate(upstream))
+				c.check(out)
+			}()
+		}
+	})
+}
