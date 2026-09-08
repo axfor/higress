@@ -49,7 +49,9 @@ type c2oProto struct {
 	systemSeen   bool
 	systemRaw    []byte
 	messagesSeen bool
-	msgsOpen     bool
+	inMessages   bool // inside the input messages array
+	msgsOpen     bool // the output messages array has been pushed
+	msgsClosed   bool // ... and popped
 	msgCount     int
 	pending      [][]byte // converted messages waiting for the system prompt, bounded
 	pendingBytes int
@@ -108,6 +110,7 @@ func (p *c2oProto) OnStart(t *Transformer, kind ValueKind) Action {
 			return Bail("messages is not an array, the buffered decode fails")
 		}
 		p.messagesSeen = true
+		p.inMessages = true
 		if p.systemSeen {
 			p.openMessages(t) // otherwise the converted messages wait for the system prompt, which has to come first
 		}
@@ -133,6 +136,9 @@ func (p *c2oProto) openMessages(t *Transformer) {
 		p.msgCount++
 	}
 	p.pending, p.pendingBytes = nil, 0
+	if !p.inMessages {
+		p.closeMessages(t) // opened after the input array had closed (a late system prompt, or the tail): nothing else will land in it
+	}
 }
 
 func (p *c2oProto) OnValue(t *Transformer, raw []byte) {
@@ -160,6 +166,10 @@ func (p *c2oProto) topValue(t *Transformer, raw []byte) {
 			return
 		}
 		p.model, p.modelSeen = s, true
+		// written at once, not in Tail: the second stage's prelude wants model as early as the input had it
+		w := t.W()
+		w.Key("model")
+		w.JSONString(s)
 	case "stream":
 		switch string(raw) {
 		case "true":
@@ -170,6 +180,15 @@ func (p *c2oProto) topValue(t *Transformer, raw []byte) {
 			return
 		}
 		p.streamSeen = !isNull
+		if p.stream {
+			w := t.W()
+			w.Key("stream")
+			w.RawString("true")
+			if !p.opt.DisableStreamUsageStats {
+				w.Key("stream_options")
+				w.RawString(`{"include_usage":true}`)
+			}
+		}
 	case "temperature", "top_p":
 		if !isNull && !isNumLiteral(raw) {
 			t.Bail(t.Last() + " is not a number")
@@ -216,7 +235,23 @@ func (p *c2oProto) OnPrefix(t *Transformer, raw []byte, complete bool) (Action, 
 	return Bail("unexpected prefix: " + t.PathString()), 0
 }
 
-func (p *c2oProto) OnLeave(t *Transformer) {}
+func (p *c2oProto) OnLeave(t *Transformer) {
+	if t.Depth() == 1 && t.Last() == "messages" {
+		p.inMessages = false
+		p.closeMessages(t) // root keys may follow the array; the output array must not swallow them
+	}
+}
+
+// closeMessages pops the output messages array once it has been opened.
+func (p *c2oProto) closeMessages(t *Transformer) {
+	if !p.msgsOpen || p.msgsClosed {
+		return
+	}
+	p.msgsClosed = true
+	w := t.W()
+	w.Open()
+	w.Pop()
+}
 
 // ---- message conversion (in memory, one message at a time) ----
 
@@ -512,23 +547,14 @@ func (p *c2oProto) Tail(t *Transformer) {
 	w := t.W()
 	if p.msgsOpen || len(p.pending) > 0 || (p.systemSeen && p.systemRaw != nil && string(p.systemRaw) != "null") {
 		p.openMessages(t) // messages that never saw a system prompt, or a system prompt alone
+		p.closeMessages(t)
 	} else {
 		w.Key("messages")
 		w.RawString("null") // no message came out: the buffered nil slice
 	}
-	if p.msgsOpen {
-		w.Open()
-		w.Pop()
-	}
-	w.Key("model")
-	w.JSONString(p.model)
-	if p.stream {
-		w.Key("stream")
-		w.RawString("true")
-		if !p.opt.DisableStreamUsageStats {
-			w.Key("stream_options")
-			w.RawString(`{"include_usage":true}`)
-		}
+	if !p.modelSeen {
+		w.Key("model")
+		w.RawString(`""`) // Model has no omitempty
 	}
 	for _, kv := range []struct {
 		k string
