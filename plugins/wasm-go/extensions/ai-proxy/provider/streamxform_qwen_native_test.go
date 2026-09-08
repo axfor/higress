@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
@@ -92,7 +91,7 @@ func TestQwenNativeDifferential(t *testing.T) {
 		for _, search := range []bool{false, true} {
 			off, oerr := officialQwenNativeErr(in, qwenNativeMapping, search)
 			for _, cs := range []int{1, 7, 4096} {
-				str, sok, why := runStream(newQwenNativeStream(search), in, cs)
+				str, sok, why := runStream(typed(newQwenNativeStream(search)), in, cs)
 				if oerr != nil {
 					if sok {
 						t.Errorf("buffered path failed but streaming passed: %s (%v)", trunc(in, 80), oerr)
@@ -116,7 +115,7 @@ func TestQwenNativeDifferential(t *testing.T) {
 }
 
 func TestQwenNativeFuzz(t *testing.T) {
-	seed := int64(time.Now().UnixNano())
+	seed := fuzzSeed()
 	r := rand.New(rand.NewSource(seed))
 	N := fuzzN(60000)
 	same, offFail, lenient, fb := 0, 0, 0, 0
@@ -128,7 +127,7 @@ func TestQwenNativeFuzz(t *testing.T) {
 		search := r.Intn(2) == 0
 		off, oerr := officialQwenNativeErr(in, qwenNativeMapping, search)
 		chunk := []int{1, 3, 17, 64, 4096}[r.Intn(5)]
-		str, sok, why := runStream(newQwenNativeStream(search), in, chunk)
+		str, sok, why := runStream(typed(newQwenNativeStream(search)), in, chunk)
 		if oerr != nil {
 			offFail++
 			if sok {

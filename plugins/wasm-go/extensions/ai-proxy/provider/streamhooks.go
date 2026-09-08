@@ -132,7 +132,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return defaultPlan(nil), ""
 
 	case c.typ == providerTypeClaude:
-		return &StreamPlan{Tr: streamxform.NewClaude(streamxform.ClaudeOptions{
+		return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewClaude(streamxform.ClaudeOptions{
 			MapModel: func(m string) (string, error) {
 				if m == "" {
 					return "", errors.New("missing model in request")
@@ -144,7 +144,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 				return mapped, nil
 			},
 			ClaudeCodeMode: c.claudeCodeMode,
-		}), ApplyStream: true, ApplyModel: true}, ""
+		}), ApplyStream: true, ApplyModel: true}), ""
 
 	case c.typ == providerTypeQwen && !c.qwenEnableCompatible:
 		// native DashScope protocol: the buffered onChatCompletionRequestBody changes the path and headers by model / stream in the body phase
@@ -173,7 +173,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			EnableSearch:             c.qwenEnableSearch,
 			DeveloperToSystem:        !isDeveloperRoleSupported(c.typ),
 		})
-		p := &StreamPlan{Tr: tr, ApplyStream: true, ApplyModel: true}
+		p := checkChatRequestTypes(&StreamPlan{Tr: tr, ApplyStream: true, ApplyModel: true})
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
 		p.AfterPrelude = func(ctx wrapper.HttpContext) {
@@ -277,12 +277,12 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			}
 			return mapped, nil
 		}
-		p := &StreamPlan{Tr: streamxform.NewGemini(streamxform.GeminiOptions{
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewGemini(streamxform.GeminiOptions{
 			MapModel:       mapStrict,
 			ThinkingModel:  func(m string) bool { return geminiThinkingModels[m] },
 			ThinkingBudget: c.geminiThinkingBudget,
 			SafetySettings: ss,
-		}), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true}
+		}), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true})
 		// buffered onChatCompletionRequestBody: path = /{version}/models/{mapped model}:{generateContent|streamGenerateContent}
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
@@ -328,6 +328,29 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return defaultPlan(nil), ""
 	}
 	return nil, "no streaming protocol implemented for provider " + c.typ
+}
+
+// chatRequestFieldTypes reproduces the type checking the buffered path gets for free.
+//
+// The buffered path decodes the whole body into chatCompletionRequest, so a field of the wrong type fails the
+// request before anything reaches the provider. The streaming path only judges the fields its transform reads
+// and passes the rest through, which on a gateway let twelve fields diverge: a wrong type in metadata, n,
+// presence_penalty, seed, user, response_format, service_tier, stream_options, top_logprobs, logit_bias,
+// logprobs or frequency_penalty was rejected when buffered and forwarded to the provider when streamed.
+//
+// The table is derived from the struct rather than written out, so adding a field to chatCompletionRequest
+// cannot silently leave the streaming path more permissive than the buffered one.
+var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
+
+// checkChatRequestTypes applies that table. It belongs only to the providers whose buffered path really does
+// decode into the struct -- claude, gemini and native qwen. The rest go through defaultTransformRequestBody,
+// which reads the body with gjson and type-checks nothing; adding the check there would make the streaming
+// path stricter than the buffered one, which is a deviation in the other direction.
+func checkChatRequestTypes(p *StreamPlan) *StreamPlan {
+	if p != nil && p.Tr != nil {
+		p.Tr.SetFieldTypes(chatRequestFieldTypes)
+	}
+	return p
 }
 
 // StreamApplyPrelude applies the side effects of the buffered path:

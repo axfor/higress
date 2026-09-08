@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 )
@@ -124,7 +123,7 @@ func TestGeminiDifferential(t *testing.T) {
 			}
 			off, ok, needFetch := officialGemini(in, sm, 1024)
 			for _, cs := range []int{1, 7, 4096} {
-				str, sok, why := runStream(newGeminiStream(safety, 1024), in, cs)
+				str, sok, why := runStream(typed(newGeminiStream(safety, 1024)), in, cs)
 				if !ok {
 					if sok {
 						t.Errorf("buffered path failed but streaming passed: %s", trunc(in, 80))
@@ -161,7 +160,7 @@ func TestGeminiDifferential(t *testing.T) {
 }
 
 func TestGeminiFuzz(t *testing.T) {
-	seed := int64(time.Now().UnixNano())
+	seed := fuzzSeed()
 	r := rand.New(rand.NewSource(seed))
 	N := fuzzN(60000)
 	same, offFail, fetch, fb, lenient := 0, 0, 0, 0, 0
@@ -176,7 +175,7 @@ func TestGeminiFuzz(t *testing.T) {
 		off, oerr, needFetch := officialGeminiErr(in, sm, budget)
 		ok := oerr == nil
 		chunk := []int{1, 3, 17, 64, 4096}[r.Intn(5)]
-		tr := newGeminiStream(safety, budget)
+		tr := typed(newGeminiStream(safety, budget))
 		str, sok, why := runStream(tr, in, chunk)
 		if !ok {
 			offFail++

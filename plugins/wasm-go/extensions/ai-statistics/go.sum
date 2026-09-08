@@ -1,5 +1,5 @@
-github.com/axfor/ason v0.0.0-20260908004025-14748f94ca72 h1:cI3XwV3e/hZe3fT1dLukBoH8IJsq6YVqKkgU8Dtr/iw=
-github.com/axfor/ason v0.0.0-20260908004025-14748f94ca72/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
+github.com/axfor/ason v0.0.0-20260908032632-7d58f06308af h1:9joyw5XyGIISlMZg5++zibM2Q/K+2WhvdN+9CD5YLQg=
+github.com/axfor/ason v0.0.0-20260908032632-7d58f06308af/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
 github.com/axfor/wasm-go v1.1.3-0.20260907232329-d199a683943d h1:JorxAD9NUYVmOaX8YlvbJ1Uz86nL4YVA7yw8XsKVXk8=
 github.com/axfor/wasm-go v1.1.3-0.20260907232329-d199a683943d/go.mod h1:uKVYICbRaxTlKqdm8E0dpjbysxM8uCPb9LV26hF3Km8=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

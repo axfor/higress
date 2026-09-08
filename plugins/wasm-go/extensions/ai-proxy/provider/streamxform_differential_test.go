@@ -68,6 +68,24 @@ func officialTransform(t *testing.T, in string) (map[string]any, bool) {
 	return officialClaude(in, false)
 }
 
+// typed wires the root-field type check exactly as the plugin does, so the differential and fuzz corpora run
+// through it too. It goes through checkChatRequestTypes rather than calling SetFieldTypes here, so the test
+// cannot drift from the decision production makes about which protocols get the check.
+// fuzzSeed 允许固定随机种子（ASON_FUZZ_SEED），用于两次跑之间做受控对比；
+// 缺省仍按时间取，保证每次跑覆盖不同语料。
+func fuzzSeed() int64 {
+	if v := os.Getenv("ASON_FUZZ_SEED"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return time.Now().UnixNano()
+}
+
+func typed(tr *streamxform.Transformer) *streamxform.Transformer {
+	return checkChatRequestTypes(&StreamPlan{Tr: tr}).Tr
+}
+
 func runStream(tr *streamxform.Transformer, in string, chunk int) (map[string]any, bool, string) {
 	var out []byte
 	for i := 0; i < len(in); i += chunk {
@@ -218,7 +236,7 @@ func TestDifferential(t *testing.T) {
 		for _, cc := range []bool{false, true} {
 			off, offOK := officialClaude(c.in, cc)
 			for _, cs := range []int{1, 7, 4096} {
-				str, ok, why := runStream(streamxform.NewClaude(streamxform.ClaudeOptions{ClaudeCodeMode: cc}), c.in, cs)
+				str, ok, why := runStream(typed(streamxform.NewClaude(streamxform.ClaudeOptions{ClaudeCodeMode: cc})), c.in, cs)
 				if !offOK {
 					if ok {
 						t.Errorf("%s(cc=%v): buffered path failed but streaming passed", c.name, cc)
@@ -625,7 +643,7 @@ func randText(r *rand.Rand) string {
 }
 
 func TestFuzzDifferential(t *testing.T) {
-	seed := int64(time.Now().UnixNano())
+	seed := fuzzSeed()
 	r := rand.New(rand.NewSource(seed))
 	N := fuzzN(20000)
 	same, fallback, offFail, lenient := 0, 0, 0, 0
@@ -635,7 +653,7 @@ func TestFuzzDifferential(t *testing.T) {
 		off, oerr := officialClaudeErr(in, cc)
 		ok := oerr == nil
 		chunk := []int{1, 3, 17, 64, 4096}[r.Intn(5)]
-		str, sok, why := runStream(streamxform.NewClaude(streamxform.ClaudeOptions{ClaudeCodeMode: cc}), in, chunk)
+		str, sok, why := runStream(typed(streamxform.NewClaude(streamxform.ClaudeOptions{ClaudeCodeMode: cc})), in, chunk)
 		if !ok {
 			offFail++
 			if sok {
@@ -768,7 +786,7 @@ func trunc(s string, n int) string {
 }
 
 func TestOpenAIFuzz(t *testing.T) {
-	seed := int64(time.Now().UnixNano())
+	seed := fuzzSeed()
 	r := rand.New(rand.NewSource(seed))
 	N := fuzzN(10000)
 	same, fb := 0, 0
@@ -1063,7 +1081,7 @@ func genVariantRequest(r *rand.Rand) string {
 }
 
 func TestVariantsFuzz(t *testing.T) {
-	seed := int64(time.Now().UnixNano())
+	seed := fuzzSeed()
 	r := rand.New(rand.NewSource(seed))
 	N := fuzzN(6000)
 	for _, vc := range variantCases() {
@@ -1147,4 +1165,64 @@ func isDiscardedFieldTypeError(err error) bool {
 func isDiscardedFieldTypeErrorIn(err error, extra map[string]bool) bool {
 	f, ok := typeErrorField(err)
 	return ok && (discardedFields[f] || extra[f])
+}
+
+// 网关上实测分叉的那 12 个字段：缓冲路径按结构体解码会拒，流式此前放行给了供应商。
+// 这里逐个钉住，任何一个回到"流式放行"都要立刻失败。
+func TestRootFieldTypesMatchBufferedRejection(t *testing.T) {
+	bad := map[string]string{
+		"frequency_penalty": `"x"`,
+		"logit_bias":        `"x"`,
+		"logprobs":          `"true"`,
+		"metadata":          `"m"`,
+		"n":                 `"one"`,
+		"presence_penalty":  `{}`,
+		"response_format":   `"json"`,
+		"seed":              `"abc"`,
+		"service_tier":      `9`,
+		"stream_options":    `"x"`,
+		"top_logprobs":      `"3"`,
+		"user":              `42`,
+	}
+	for f, v := range bad {
+		in := `{"model":"m","messages":[{"role":"user","content":"U"}],"` + f + `":` + v + `}`
+		if _, oerr := officialClaudeErr(in, false); oerr == nil {
+			t.Fatalf("字段 %s：缓冲路径居然接受了 %s，用例失效", f, v)
+		}
+		for _, chunk := range []int{1, 17, 4096} {
+			_, sok, _ := runStream(typed(streamxform.NewClaude(streamxform.ClaudeOptions{})), in, chunk)
+			if sok {
+				t.Errorf("字段 %s = %s（分块 %d）：缓冲路径拒绝而流式放行了", f, v, chunk)
+			}
+		}
+	}
+}
+
+// 反方向同样要钉住：类型正确的值一个都不能被拦。
+func TestRootFieldTypesAcceptValidValues(t *testing.T) {
+	good := map[string]string{
+		"frequency_penalty": `0.5`,
+		"logit_bias":        `{"a":1}`,
+		"logprobs":          `true`,
+		"metadata":          `{"k":"v"}`,
+		"n":                 `1`,
+		"presence_penalty":  `0`,
+		"response_format":   `{"type":"json_object"}`,
+		"seed":              `42`,
+		"service_tier":      `"auto"`,
+		"stream_options":    `{"include_usage":true}`,
+		"top_logprobs":      `3`,
+		"user":              `"u"`,
+		"max_tokens":        `null`,
+		"temperature":       `null`,
+		"stop":              `null`,
+	}
+	for f, v := range good {
+		in := `{"model":"m","messages":[{"role":"user","content":"U"}],"` + f + `":` + v + `}`
+		for _, chunk := range []int{1, 17, 4096} {
+			if _, sok, why := runStream(typed(streamxform.NewClaude(streamxform.ClaudeOptions{})), in, chunk); !sok {
+				t.Errorf("字段 %s = %s（分块 %d）被误拦：%s", f, v, chunk, why)
+			}
+		}
+	}
 }

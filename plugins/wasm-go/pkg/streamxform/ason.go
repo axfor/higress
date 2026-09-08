@@ -47,7 +47,24 @@ const (
 // generous chunk. Sized once per VM, never per request.
 const OutBufferSize = 128 << 10
 
+type (
+	// FieldTypes is the set of JSON types a root-level field may have.
+	FieldTypes = ason.FieldTypes
+)
+
+const (
+	TypeString = ason.TypeString
+	TypeNumber = ason.TypeNumber
+	TypeBool   = ason.TypeBool
+	TypeObject = ason.TypeObject
+	TypeArray  = ason.TypeArray
+	TypeAny    = ason.TypeAny
+)
+
 var (
+	// FieldTypesOf derives the root-level field type table from the struct the buffered path unmarshals into.
+	FieldTypesOf = ason.FieldTypesOf
+
 	NewTransformer = ason.NewTransformer
 	Pass           = ason.Pass
 	Skip           = ason.Skip
