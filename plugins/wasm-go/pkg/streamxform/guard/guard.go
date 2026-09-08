@@ -73,15 +73,56 @@ type State struct {
 // the next, so after the first request no key dispatch allocates.
 var keyCache = streamxform.NewKeyCache()
 
+// outBufs is a free list of output buffers, one per in-flight transforming stream.
+//
+// A stream cannot share a buffer with another -- output accumulates across chunks until the commit point, and
+// one Envoy worker interleaves its streams -- but it can inherit the buffer a finished stream no longer needs.
+// Without this every request grew its own buffer from nothing, doubling up to a commit window and leaving the
+// old copies as garbage: about four allocations and a quarter of a megabyte per request, and most of what the
+// GC watchdog was collecting. The peak is unchanged (each in-flight stream still holds one buffer); the churn
+// is gone. The list is per VM, so it needs no locking.
+var outBufs [][]byte
+
+func takeOutBuf() []byte {
+	if n := len(outBufs); n > 0 {
+		b := outBufs[n-1]
+		outBufs = outBufs[:n-1]
+		return b[:0]
+	}
+	return make([]byte, 0, streamxform.OutBufferSize)
+}
+
+func putOutBuf(b []byte) {
+	if cap(b) == 0 || len(outBufs) >= outBufsMax {
+		return
+	}
+	outBufs = append(outBufs, b[:0])
+}
+
+// outBufsMax bounds the free list: past it a returned buffer is dropped for the GC. It is sized above the
+// admission limit so that steady-state traffic never allocates, and stops a burst from pinning memory forever.
+const outBufsMax = 1024
+
 func New(p *Plan) *State {
 	s := &State{plan: p}
 	if p.Tr != nil {
 		p.Tr.SetKeyCache(keyCache)
 	}
 	if p.Tr != nil && p.Mode != Observe && !p.Passthrough {
-		p.Tr.SetSink(func(b []byte) { s.out = append(s.out, b...) })
+		s.out = takeOutBuf()
+		p.Tr.SetOutBuffer(s.out) // the engine writes into it directly; Out hands it back without copying
 	}
 	return s
+}
+
+// Release returns the stream's output buffer to the free list. Feed calls it on the last chunk; a plugin that
+// learns of an aborted stream through the host (ProcessStreamDone) should call it too, so an upload the client
+// dropped mid-way does not keep its buffer out of circulation. Idempotent.
+func (s *State) Release() {
+	if s.out != nil {
+		putOutBuf(s.out)
+		s.out = nil
+	}
 }
 
 // prelude returns the protocol's prelude, from the transformer while it is alive and from the copy kept when
@@ -185,10 +226,14 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		}
 		return chunk, types.ActionContinue
 	}
-	s.out = s.out[:0]
 	tr.Write(chunk)
+	var out []byte
 	if last {
-		tr.Finish() // the remaining output arrives through the sink as well
+		// Finish appends the tail to the buffer and returns all of it; taking Out first would drain the
+		// buffer and then alias it with the tail, since both are the same caller-owned array.
+		out = tr.Finish()
+	} else {
+		out = tr.Out() // nil before the commit point; past it, the caller-owned buffer, valid until the next Write
 	}
 	if bad, why := tr.Unsupported(); bad {
 		code := codeOf(tr)
@@ -215,11 +260,14 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		s.sent = true
 		s.metric("streamed")
 	}
-	out := s.out
 	if last {
 		if s.plan.OnFinish != nil {
 			s.plan.OnFinish(Prelude(tr))
 		}
+		// Released as Feed returns, before the caller reads out -- which is safe only because nothing can
+		// reuse the buffer in between: takeOutBuf runs in New, on another stream's first chunk, and on a
+		// single-threaded VM no other callback runs until this one has returned and the host has copied out.
+		defer s.Release()
 	} else if s.plan.Mode == PrefixTransform && tr.RootDone() {
 		// The chunk that released also carried the end of the root. The engine still holds the closing token
 		// and any trailing whitespace for Finish, so the transformer has to stay until the end of the stream.
