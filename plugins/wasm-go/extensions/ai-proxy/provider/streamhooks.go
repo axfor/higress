@@ -340,6 +340,8 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 //
 // The table is derived from the struct rather than written out, so adding a field to chatCompletionRequest
 // cannot silently leave the streaming path more permissive than the buffered one.
+// chatRequestFieldTypes is the flat root-level table. The tree below carries the same root types, so the
+// plugin only sets the tree; this stays because the differential tests measure what each level catches.
 var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
 
 // chatRequestFieldTree is the recursive form. The root-level table catches a field of the wrong type; the tree
@@ -356,8 +358,7 @@ var chatRequestFieldTree = streamxform.FieldTreeOf(&chatCompletionRequest{}, 6)
 // path stricter than the buffered one, which is a deviation in the other direction.
 func checkChatRequestTypes(p *StreamPlan) *StreamPlan {
 	if p != nil && p.Tr != nil && ChatRequestTypeCheck {
-		p.Tr.SetFieldTypes(chatRequestFieldTypes)
-		p.Tr.SetFieldTree(chatRequestFieldTree)
+		p.Tr.SetFieldTree(chatRequestFieldTree) // the tree carries the root fields' own types as well
 	}
 	return p
 }

@@ -68,8 +68,16 @@ type State struct {
 // accumulates output across chunks until the commit point, so a buffer shared between streams would mix them.
 // Within a request it is reused from chunk to chunk, and a chunk the transformer forwarded untouched costs no
 // buffer at all — Feed hands back the caller's own bytes and the driver skips the host replace entirely.
+// keyCache is shared by every transformer on this wasm VM. One VM serves one Envoy worker, whose streams
+// interleave but never run concurrently, so a single cache is safe; the keys of one request are the keys of
+// the next, so after the first request no key dispatch allocates.
+var keyCache = streamxform.NewKeyCache()
+
 func New(p *Plan) *State {
 	s := &State{plan: p}
+	if p.Tr != nil {
+		p.Tr.SetKeyCache(keyCache)
+	}
 	if p.Tr != nil && p.Mode != Observe && !p.Passthrough {
 		p.Tr.SetSink(func(b []byte) { s.out = append(s.out, b...) })
 	}

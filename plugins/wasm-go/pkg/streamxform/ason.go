@@ -52,6 +52,8 @@ type (
 	FieldTypes = ason.FieldTypes
 	// FieldTree is the recursive form: what a value may be, and what its children may be.
 	FieldTree = ason.FieldTree
+	// KeyCache interns keys across transformers on one wasm VM, so a key one request taught it costs the next nothing.
+	KeyCache = ason.KeyCache
 )
 
 const (
@@ -71,6 +73,7 @@ var (
 	FieldTreeOf = ason.FieldTreeOf
 
 	NewTransformer = ason.NewTransformer
+	NewKeyCache    = ason.NewKeyCache
 	Pass           = ason.Pass
 	Skip           = ason.Skip
 	Capture        = ason.Capture
