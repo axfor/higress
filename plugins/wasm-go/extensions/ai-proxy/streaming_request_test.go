@@ -562,3 +562,66 @@ func TestStreamingRequest_BedrockConverse(t *testing.T) {
 		require.Equal(t, "bedrock-runtime.us-east-1.amazonaws.com", requestHeader(host, ":authority"))
 	})
 }
+
+var streamingGeminiEmbConfig = json.RawMessage(`{"provider":{"type":"gemini","apiTokens":["g-key"],"modelMapping":{"m":"text-embedding-004"}}}`)
+var streamingQwenNativeEmbConfig = json.RawMessage(`{"provider":{"type":"qwen","apiTokens":["q"],"qwenEnableCompatible":false,"modelMapping":{"m":"text-embedding-v3"}}}`)
+var streamingVertexEmbConfig = json.RawMessage(`{"provider":{"type":"vertex","apiTokens":["vk"],"modelMapping":{"m":"text-embedding-005"}}}`)
+
+// Embeddings: the input array streams element by element into each provider's shape; the path follows the mapped model.
+func TestStreamingRequest_Embeddings(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		big := strings.Repeat("e", 100000)
+		body := `{"input":["` + big + `","second"],"model":"m","dimensions":3}`
+		for _, c := range []struct {
+			cfg   json.RawMessage
+			check func(out map[string]any)
+			path  string
+		}{
+			{streamingGeminiEmbConfig, func(out map[string]any) {
+				reqs := out["requests"].([]any)
+				require.Len(t, reqs, 2)
+				require.Equal(t, "models/text-embedding-004", reqs[0].(map[string]any)["model"])
+				require.Equal(t, "second", reqs[1].(map[string]any)["content"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"])
+			}, "/v1beta/models/text-embedding-004:batchEmbedContents"},
+			{streamingVertexEmbConfig, func(out map[string]any) {
+				inst := out["instances"].([]any)
+				require.Len(t, inst, 2)
+				require.Equal(t, big, inst[0].(map[string]any)["content"])
+				require.Equal(t, "", inst[0].(map[string]any)["task_type"])
+			}, "/v1/publishers/google/models/text-embedding-005:predict?key=vk"},
+			{streamingQwenNativeEmbConfig, func(out map[string]any) {
+				require.Equal(t, "text-embedding-v3", out["model"])
+				require.Equal(t, []any{big, "second"}, out["input"].(map[string]any)["texts"])
+				require.Equal(t, map[string]any{}, out["parameters"])
+			}, "/api/v1/services/embeddings/text-embedding/text-embedding"},
+		} {
+			host, status := wasmtest.NewTestHost(c.cfg)
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/embeddings"))
+			actions, upstream := feedChunks(host, []byte(body), 4096)
+			require.Equal(t, types.ActionPause, actions[0])
+			require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(upstream, &out), truncate(upstream))
+			c.check(out)
+			require.Equal(t, c.path, requestHeader(host, ":path"))
+			host.Reset()
+		}
+	})
+}
+
+// Gemini image generation: a tiny rebuilt body and the predict path.
+func TestStreamingRequest_GeminiImageGeneration(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingGeminiEmbConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/images/generations"))
+		require.Equal(t, types.ActionContinue, host.CallOnHttpStreamingRequestBody([]byte(`{"model":"m","prompt":"a cat","n":2,"size":"1024x1024"}`), true))
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(host.GetRequestBody(), &out))
+		require.Equal(t, []any{map[string]any{"prompt": "a cat"}}, out["instances"])
+		require.Equal(t, map[string]any{"sampleCount": float64(2)}, out["parameters"])
+		require.Equal(t, "/v1beta/models/text-embedding-004:predict", requestHeader(host, ":path"))
+	})
+}

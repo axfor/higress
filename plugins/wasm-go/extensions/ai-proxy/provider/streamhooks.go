@@ -171,6 +171,17 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			ClaudeCodeMode: c.claudeCodeMode,
 		}), ApplyStream: true, ApplyModel: true}), ""
 
+	case c.typ == providerTypeQwen && !c.qwenEnableCompatible && apiName == ApiNameEmbeddings:
+		// onEmbeddingsRequestBody: parseRequestAndMapModel and buildQwenTextEmbeddingRequest; the path is header-phase work.
+		if c.providerBasePath != "" {
+			return nil, "providerBasePath needs :path changed in the body phase"
+		}
+		p := &StreamPlan{Tr: streamxform.NewQwenEmbeddings(streamxform.EmbeddingsOptions{MapModel: c.mapStrict()}), ApplyModel: true, RequireModelBeforeCommit: true}
+		if ChatRequestTypeCheck {
+			p.Tr.SetFieldTree(embeddingsFieldTree)
+		}
+		return p, ""
+
 	case c.typ == providerTypeQwen && !c.qwenEnableCompatible:
 		// native DashScope protocol: the buffered onChatCompletionRequestBody changes the path and headers by model / stream in the body phase
 		if !isChat {
@@ -320,6 +331,33 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		return defaultPlan(v), ""
 
+	case c.typ == providerTypeGemini && (apiName == ApiNameEmbeddings || apiName == ApiNameImageGeneration):
+		// onEmbeddingsRequestBody / onImageGenerationRequestBody: parseRequestAndMapModel, the path from the mapped model,
+		// and a small rebuilt body. The Accept header is snapshot-overwritten as for chat.
+		gp, ok := prov.(*geminiProvider)
+		if !ok {
+			return nil, "unexpected gemini provider instance type"
+		}
+		p := &StreamPlan{ApplyModel: true, RequireModelBeforeCommit: true, NoAcceptHeader: true}
+		if apiName == ApiNameEmbeddings {
+			p.Tr = streamxform.NewGeminiEmbeddings(streamxform.EmbeddingsOptions{MapModel: c.mapStrict()})
+			if ChatRequestTypeCheck {
+				p.Tr.SetFieldTree(embeddingsFieldTree)
+			}
+		} else {
+			p.Tr = streamxform.NewGeminiImage(streamxform.EmbeddingsOptions{MapModel: c.mapStrict()})
+			if ChatRequestTypeCheck {
+				p.Tr.SetFieldTree(imageGenerationFieldTree)
+			}
+		}
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			if err := util.OverwriteRequestPath(gp.getRequestPath(apiName, model, false)); err != nil {
+				log.Errorf("geminiProvider: overwrite request path failed: %v", err)
+			}
+		}
+		return p, ""
+
 	case c.typ == providerTypeGemini:
 		gp, ok := prov.(*geminiProvider)
 		if !ok {
@@ -362,6 +400,29 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			if err := util.OverwriteRequestPath(gp.getRequestPath(ApiNameChatCompletion, model, stream)); err != nil {
 				log.Errorf("geminiProvider: overwrite request path failed: %v", err)
 			}
+		}
+		return p, ""
+
+	case c.typ == providerTypeVertex && apiName == ApiNameEmbeddings && !c.vertexOpenAICompatible:
+		// onEmbeddingsRequestBody: parseRequestAndMapModel, the predict path from the mapped model, instances from input.
+		vp, ok := prov.(*vertexProvider)
+		if !ok {
+			return nil, "unexpected vertex provider instance type"
+		}
+		auth, why := c.vertexAuth(vp)
+		if why != "" {
+			return nil, why
+		}
+		p := &StreamPlan{Tr: streamxform.NewVertexEmbeddings(streamxform.EmbeddingsOptions{MapModel: c.mapStrict()}), ApplyModel: true, RequireModelBeforeCommit: true, NoAcceptHeader: true}
+		if ChatRequestTypeCheck {
+			p.Tr.SetFieldTree(embeddingsFieldTree)
+		}
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			if err := util.OverwriteRequestPath(vp.getRequestPath(ctx, ApiNameEmbeddings, model, false)); err != nil {
+				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
+			}
+			auth()
 		}
 		return p, ""
 
@@ -629,6 +690,10 @@ var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
 //
 // Depth 6 covers chatCompletionRequest down to functionCall, which is as deep as it goes.
 var chatRequestFieldTree = streamxform.FieldTreeOf(&chatCompletionRequest{}, 6)
+
+// The non-chat endpoints decode into their own structs; their trees serve the same purpose.
+var embeddingsFieldTree = streamxform.FieldTreeOf(&embeddingsRequest{}, 3)
+var imageGenerationFieldTree = streamxform.FieldTreeOf(&imageGenerationRequest{}, 3)
 
 // checkChatRequestTypes applies that table. It belongs only to the providers whose buffered path really does
 // decode into the struct -- claude, gemini and native qwen. The rest go through defaultTransformRequestBody,
