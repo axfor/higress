@@ -461,6 +461,48 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		return p, ""
 
+	case c.typ == providerTypeVertex && (apiName == ApiNameImageGeneration || apiName == ApiNameImageEdit || apiName == ApiNameImageVariation) && !c.vertexOpenAICompatible:
+		// onImageGenerationRequestBody / onImageEditRequestBody / onImageVariationRequestBody: parseRequestAndMapModel,
+		// the generateContent path from the mapped model, one user turn of the image parts and the prompt. The image
+		// inputs stream (a data URL's payload goes out as it arrives); a multipart body never gets here.
+		vp, ok := prov.(*vertexProvider)
+		if !ok {
+			return nil, "unexpected vertex provider instance type"
+		}
+		auth, why := c.vertexAuth(vp)
+		if why != "" {
+			return nil, why
+		}
+		kind, tree := streamxform.VertexImageGeneration, imageGenerationFieldTree
+		switch apiName {
+		case ApiNameImageEdit:
+			kind, tree = streamxform.VertexImageEdit, imageEditFieldTree
+		case ApiNameImageVariation:
+			kind, tree = streamxform.VertexImageVariation, imageVariationFieldTree
+		}
+		var ss []streamxform.GeminiSafetySetting
+		for k, v := range c.geminiSafetySetting {
+			ss = append(ss, streamxform.GeminiSafetySetting{Category: k, Threshold: v})
+		}
+		sort.Slice(ss, func(i, j int) bool { return ss[i].Category < ss[j].Category })
+		p := &StreamPlan{Tr: streamxform.NewVertexImage(streamxform.VertexImageOptions{
+			Kind: kind, MapModel: c.mapStrict(), SafetySettings: ss, DetectMime: detectMimeTypeFromURL, ParseSize: vp.parseImageSize,
+		}), ApplyModel: true, RequireModelBeforeCommit: true, NoAcceptHeader: true}
+		if ChatRequestTypeCheck {
+			p.Tr.SetFieldTree(tree)
+		}
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			if err := util.OverwriteRequestPath(vp.getRequestPath(ctx, apiName, model, false)); err != nil {
+				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
+			}
+			if apiName != ApiNameImageGeneration { // the buffered edit / variation handlers pin the content type
+				_ = proxywasm.ReplaceHttpRequestHeader("Content-Type", util.MimeTypeApplicationJson)
+			}
+			auth()
+		}
+		return p, ""
+
 	case c.typ == providerTypeVertex && apiName == ApiNameAnthropicMessages:
 		// /v1/messages goes to :rawPredict / :streamRawPredict with the Anthropic body kept: model is read for the path
 		// and dropped from the body, anthropic_version and a default max_tokens are added, context_management removed.
@@ -732,6 +774,8 @@ var claudeRequestFieldTree = streamxform.FieldTreeOf(&claudeTextGenRequest{}, 6)
 // The non-chat endpoints decode into their own structs; their trees serve the same purpose.
 var embeddingsFieldTree = streamxform.FieldTreeOf(&embeddingsRequest{}, 3)
 var imageGenerationFieldTree = streamxform.FieldTreeOf(&imageGenerationRequest{}, 3)
+var imageEditFieldTree = streamxform.FieldTreeOf(&imageEditRequest{}, 3)
+var imageVariationFieldTree = streamxform.FieldTreeOf(&imageVariationRequest{}, 3)
 
 // checkChatRequestTypes applies that table. It belongs only to the providers whose buffered path really does
 // decode into the struct -- claude, gemini and native qwen. The rest go through defaultTransformRequestBody,

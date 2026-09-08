@@ -740,3 +740,91 @@ func TestStreamingRequest_ClaudeInputToOpenAI(t *testing.T) {
 		require.Equal(t, "api.openai.com", requestHeader(host, ":authority"))
 	})
 }
+
+var streamingVertexImageConfig = json.RawMessage(`{"provider":{"type":"vertex","apiTokens":["vk"],"modelMapping":{"m":"gemini-2.5-flash-image"},"geminiSafetySetting":{"HARM_CATEGORY_HATE_SPEECH":"BLOCK_NONE"}}}`)
+
+// Vertex images: generations rebuild a tiny body; edits and variations stream the image inputs (a data URL's payload
+// goes out as it arrives) with the prompt written last; the path is generateContent for all three.
+func TestStreamingRequest_VertexImages(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		const path = "/v1/publishers/google/models/gemini-2.5-flash-image:generateContent?key=vk"
+		payload := strings.Repeat("iVBORw0KGgoAAAANSUhEUg", 15000) // ~330KB of base64
+		parts := func(out map[string]any) []any {
+			contents := out["contents"].([]any)
+			require.Len(t, contents, 1)
+			require.Equal(t, "user", contents[0].(map[string]any)["role"])
+			return contents[0].(map[string]any)["parts"].([]any)
+		}
+		for _, c := range []struct {
+			name, endpoint, body string
+			streamed             bool
+			check                func(out map[string]any)
+		}{
+			{"generation", "/v1/images/generations", `{"model":"m","prompt":"a cat","size":"1792x1024","output_format":"jpeg","n":2}`, false, func(out map[string]any) {
+				require.Equal(t, []any{map[string]any{"text": "a cat"}}, parts(out))
+				cfg := out["generationConfig"].(map[string]any)
+				require.Equal(t, []any{"TEXT", "IMAGE"}, cfg["responseModalities"])
+				img := cfg["imageConfig"].(map[string]any)
+				require.Equal(t, "16:9", img["aspectRatio"])
+				require.Equal(t, "2k", img["imageSize"])
+				require.Equal(t, map[string]any{"mimeType": "image/jpeg"}, img["imageOutputOptions"])
+				require.Equal(t, []any{map[string]any{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}}, out["safetySettings"])
+			}},
+			{"edit", "/v1/images/edits", `{"model":"m","prompt":"make it blue","image":"data:image/png;base64,` + payload + `","mask":""}`, true, func(out map[string]any) {
+				p := parts(out)
+				require.Len(t, p, 2)
+				require.Equal(t, map[string]any{"inlineData": map[string]any{"mimeType": "image/png", "data": payload}}, p[0])
+				require.Equal(t, map[string]any{"text": "make it blue"}, p[1])
+			}},
+			{"variation", "/v1/images/variations", `{"model":"m","images":[{"image_url":{"url":"data:image/jpeg;base64,` + payload + `"}},"https://x.test/a.png"]}`, true, func(out map[string]any) {
+				p := parts(out)
+				require.Len(t, p, 3)
+				require.Equal(t, map[string]any{"inlineData": map[string]any{"mimeType": "image/jpeg", "data": payload}}, p[0])
+				require.Equal(t, map[string]any{"fileData": map[string]any{"mimeType": "image/png", "fileUri": "https://x.test/a.png"}}, p[1])
+				require.Equal(t, map[string]any{"text": "Create variations of the provided image."}, p[2])
+			}},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(streamingVertexImageConfig)
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status)
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders(c.endpoint))
+				actions, upstream := feedChunks(host, []byte(c.body), 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				if c.streamed {
+					require.Equal(t, types.ActionContinue, actions[len(actions)/2], "%s: released past the window", c.name)
+				}
+				var out map[string]any
+				require.NoError(t, json.Unmarshal(upstream, &out), c.name)
+				c.check(out)
+				require.Equal(t, path, requestHeader(host, ":path"), c.name)
+				require.Equal(t, "application/json", requestHeader(host, "Content-Type"), c.name)
+				require.Equal(t, "", requestHeader(host, "Authorization"), c.name)
+			}()
+		}
+	})
+}
+
+// Vertex edits with the model after a large image: the path needs the model, so the request takes the buffered path
+// and still comes out converted; a non-empty mask is rejected on both paths.
+func TestStreamingRequest_VertexImagesFallback(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		payload := strings.Repeat("iVBORw0KGgoAAAANSUhEUg", 5000)
+		host, status := wasmtest.NewTestHost(streamingVertexImageConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/images/edits"))
+		body := `{"prompt":"blue","image":"data:image/png;base64,` + payload + `","model":"m"}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		for i, a := range actions[:len(actions)-1] {
+			require.Equal(t, types.ActionPause, a, "chunk %d: held for the buffered path", i)
+		}
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		p := out["contents"].([]any)[0].(map[string]any)["parts"].([]any)
+		require.Len(t, p, 2)
+		require.Equal(t, payload, p[0].(map[string]any)["inlineData"].(map[string]any)["data"])
+		require.Equal(t, "/v1/publishers/google/models/gemini-2.5-flash-image:generateContent?key=vk", requestHeader(host, ":path"))
+	})
+}

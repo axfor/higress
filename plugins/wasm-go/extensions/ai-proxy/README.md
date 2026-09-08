@@ -42,7 +42,7 @@ description: AI 代理插件配置参考
 - `generic`（请求体逐块直接放行）；Claude 原生接口（`/v1/messages`、`/v1/complete`、embeddings）以及上述透传供应商的其他 JSON 接口（images / audio / responses / videos / fine-tuning 等）。multipart 请求仍走全量路径；
 - Claude 协议入站的自动转换（`/v1/messages` 打到不原生支持 Anthropic 协议的 OpenAI 兼容供应商）：引擎里两个转换器串联，先 Claude → OpenAI（每条消息整条有界持有后按官方规则转换，system 在 messages 之后时整个 messages 有界持有），再走该供应商的透传转换；有自己转换逻辑的供应商（zhipuai、openrouter、qwen、minimax、azure 等）仍走全量路径；
 - Gemini 原生 `generateContent` / `streamGenerateContent`（全量路径本就不改 body，逐块放行）；
-- embeddings：`gemini`（`input` 数组逐元素变 `requests`，元素要带模型名，`input` 在 `model` 之前时整个 `input` 有界持有）、`vertex`、`qwen` 原生（非字符串元素与全量路径同样拒绝）；`gemini` 的 `/v1/images/generations`；
+- embeddings：`gemini`（`input` 数组逐元素变 `requests`，元素要带模型名，`input` 在 `model` 之前时整个 `input` 有界持有）、`vertex`、`qwen` 原生（非字符串元素与全量路径同样拒绝）；`gemini` 的 `/v1/images/generations`；`vertex` 的 `/v1/images/generations` / `edits` / `variations`（JSON 请求体；图片输入的 data URL 边到边出成 `inlineData`，http(s) 链接须在 8KB 内，prompt 最后写出；`images` 与 `image` 同时给且 `image` 在前时 parts 顺序按到达顺序，一个输入同时给非空的 `url` 与 `image_url` 时拒绝而不是取后者；multipart 请求体仍走全量路径）；
 - `protocol: original` 的所有供应商（全量路径在 original 下不碰 body），例外是对 body 签名的 hunyuan 与 AK/SK 模式的 bedrock，以及在 original 下同样重建 body 的 Pro 接口模式 minimax；
 - bedrock Converse 的 chat（apiTokens 模式；OpenAI → Converse 整份映射：system 块、toolUse / toolResult 块与合并、data URL 图片、inferenceConfig / thinking / toolConfig；配置了 prompt cache 且模型支持时回落，缓存点要落在最后一条 user 消息上）；
 - bedrock Mantle `/v1/messages`（apiTokens 模式，只做模型映射与 Accept 头；AK/SK 模式要对 body 做 SigV4 签名，仍走全量）；
@@ -57,7 +57,7 @@ description: AI 代理插件配置参考
 - `kling` 的 `/v1/videos`（body 原样，`model` 映射进 `model_name`；路径由是否带图片输入字段决定，body 超过窗口且尚未见到图片字段时回落）；
 - vertex 的 chat（OpenAI → Anthropic 格式或 Vertex 自己的 Gemini 格式，按映射后的模型选择）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内。Gemini 格式下 assistant 消息的内容要等 `tool_calls` 到齐（超过 1MB 回落），含 http(s) 图片链接的 URL 须在 8KB 内。
 
-其余供应商（Vertex 的生图与图片编辑、AK/SK 模式的 Bedrock、Hunyuan）以及配置了
+其余供应商（AK/SK 模式的 Bedrock、Hunyuan）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
 `responseJsonSchema` / `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 `firstByteTimeout` 在 chat 上照常生效（`stream` 须出现在窗口内，否则回落），`providerBasePath` 对所有供应商照常生效。
