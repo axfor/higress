@@ -1048,3 +1048,62 @@ func TestStreamingRequest_MergeConsecutive(t *testing.T) {
 		}
 	})
 }
+
+// Native Qwen: qwenFileIds puts the file list in as a system message for qwen-long, the leading system messages
+// folded into one; the setting context inserts the file's content in place. One host per case: the emulator
+// runs one plugin instance at a time.
+func TestStreamingRequest_QwenNativeInsert(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		big := strings.Repeat("w", 100000)
+		const fileContent = "Context from the file."
+		func() {
+			host, status := wasmtest.NewTestHost(json.RawMessage(`{"provider":{"type":"qwen","apiTokens":["q"],"qwenEnableCompatible":false,"modelMapping":{"m":"qwen-long"},"qwenFileIds":["f1","f2"]}}`))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+			body := `{"model":"m","stream":false,"messages":[{"role":"system","content":"S1"},{"role":"system","content":"S2"},{"role":"user","content":"` + big + `"}]}`
+			actions, upstream := feedChunks(host, []byte(body), 4096)
+			require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+			require.Equal(t, types.ActionContinue, actions[len(actions)-2], "released past the window")
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(upstream, &out), truncate(upstream))
+			msgs := out["input"].(map[string]any)["messages"].([]any)
+			require.Len(t, msgs, 3)
+			require.Equal(t, map[string]any{"role": "system", "content": "S1\nS2"}, msgs[0])
+			require.Equal(t, map[string]any{"role": "system", "content": "fileid://f1,fileid://f2"}, msgs[1])
+			require.Equal(t, big, msgs[2].(map[string]any)["content"])
+			require.Equal(t, "qwen-long", out["model"])
+		}()
+
+		// context on native qwen: fetched by the first request (buffered), inserted by the second (streaming)
+		func() {
+			host, status := wasmtest.NewTestHost(json.RawMessage(`{"provider":{"type":"qwen","apiTokens":["q"],"qwenEnableCompatible":false,"modelMapping":{"m":"qwen-plus"},"context":{"fileUrl":"http://ctxfile/context.txt","serviceName":"ctxfile.default.svc.cluster.local","servicePort":80}}}`))
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			body := `{"model":"m","stream":false,"messages":[{"role":"user","content":"` + big + `"}]}`
+			check := func(out map[string]any) {
+				msgs := out["input"].(map[string]any)["messages"].([]any)
+				require.Len(t, msgs, 3)
+				require.Equal(t, map[string]any{"role": "system", "content": "You are a helpful assistant."}, msgs[0])
+				require.Equal(t, map[string]any{"role": "system", "content": fileContent}, msgs[1])
+				require.Equal(t, "user", msgs[2].(map[string]any)["role"])
+			}
+			host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+			actions, _ := feedChunks(host, []byte(body), 4096)
+			require.Equal(t, types.ActionPause, actions[len(actions)-1], "the buffered path waits for the file")
+			require.Len(t, host.GetHttpCalloutAttributes(), 1)
+			host.CallOnHttpCall([][2]string{{":status", "200"}}, []byte(fileContent))
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(host.GetRequestBody(), &out), truncate(host.GetRequestBody()))
+			check(out)
+			host.CompleteHttp()
+			host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+			actions, upstream := feedChunks(host, []byte(body), 4096)
+			require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+			require.Equal(t, types.ActionContinue, actions[len(actions)-2], "released past the window")
+			out = nil
+			require.NoError(t, json.Unmarshal(upstream, &out), truncate(upstream))
+			check(out)
+		}()
+	})
+}

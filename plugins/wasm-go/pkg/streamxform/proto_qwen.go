@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 )
 
 // Streaming conversion OpenAI → the native Tongyi Qianwen DashScope protocol (qwenEnableCompatible=false).
@@ -24,7 +25,20 @@ type QwenNativeOptions struct {
 	// DeveloperToSystem: the buffered handleRequestBody turns the developer role into system for providers that do not support it
 	// (the whole request goes through a struct round trip there, but a DashScope request is struct-built anyway, so only role is visible).
 	DeveloperToSystem bool
+	// InsertSystem, when set, is the content of the system message qwenProvider.insertHttpContextMessage adds to
+	// input.messages: the setting context's file, or for qwenFileIds the "fileid://..." list. It goes in front of
+	// the first message whose role is not system; when that is the first message (or there is none), a dummy
+	// system message ("You are a helpful assistant.") precedes it. Every message is held until its role is known.
+	InsertSystem *string
+	// MergeLeadingSystem (qwenFileIds): the system messages before the first non-system one are folded into one,
+	// their text contents joined by newlines, written in front of the inserted message.
+	MergeLeadingSystem bool
+	// InsertOnlyForModel, when set, limits the insertion to requests whose mapped model is this one (qwen-long for
+	// qwenFileIds). model then has to come before messages.
+	InsertOnlyForModel string
 }
+
+const qwenDummySystemContent = "You are a helpful assistant."
 
 const (
 	qwenResultFormatMessage = "message"
@@ -68,6 +82,21 @@ type qwenMsg struct {
 	contentWritten bool
 	finalizing     bool
 	part           qwenPart
+
+	// InsertSystem: the message's keys wait for its role (hold); a leading system message being folded for
+	// MergeLeadingSystem keeps only what the fold needs (fold)
+	hold bool
+	fold bool
+	text string // folded: the text content, StringContent's form
+	name string
+	rc   string
+	rich bool // folded: content was not a string, or tool_calls were present (only the all-system case needs them back)
+}
+
+// leadSys is a leading system message folded for MergeLeadingSystem.
+type leadSys struct {
+	text, name, rc string
+	rich           bool
 }
 
 type qwenProto struct {
@@ -88,6 +117,12 @@ type qwenProto struct {
 	inputMsgs     int
 	reasoningSeen bool
 	m             qwenMsg
+
+	// InsertSystem
+	insActive   bool // decided when messages starts
+	insInserted bool
+	insLeading  int       // system messages written in place before the insertion point
+	insFolded   []leadSys // MergeLeadingSystem: the leading system messages held back
 }
 
 // NewQwenNative builds the OpenAI → native DashScope transformer.
@@ -137,6 +172,18 @@ func (p *qwenProto) OnKey(t *Transformer) Action {
 		return Skip() // the buffered qwenTextGenParameters reads no other field
 	case 3:
 		m := &p.m
+		if m.fold { // a leading system message being folded: only its text, name and reasoning matter
+			switch t.Last() {
+			case "content", "name", "reasoning_content":
+				return Capture(partWaitCap)
+			case "tool_calls":
+				return Capture(assistantWaitCap)
+			}
+			return Skip()
+		}
+		if m.hold && !m.roleSeen && t.Last() != "role" {
+			return Defer(roleWaitCap) // nothing of this message may go out before its role places the insertion
+		}
 		switch t.Last() {
 		case "role":
 			return Capture(256)
@@ -210,6 +257,15 @@ func (p *qwenProto) OnStart(t *Transformer, kind ValueKind) Action {
 		if kind != KindArray {
 			return Bail("messages is not an array")
 		}
+		if p.opt.InsertSystem != nil {
+			if p.opt.InsertOnlyForModel == "" {
+				p.insActive = true
+			} else if !p.modelSeen {
+				return Bail("the insertion depends on the model, which has not arrived before messages")
+			} else {
+				p.insActive = p.mapped == p.opt.InsertOnlyForModel
+			}
+		}
 		w.PushObj("input")
 		w.PushArr("messages")
 		return Enter().Flat()
@@ -219,6 +275,10 @@ func (p *qwenProto) OnStart(t *Transformer, kind ValueKind) Action {
 		}
 		p.m = qwenMsg{}
 		p.inputMsgs++
+		if p.insActive && !p.insInserted {
+			p.m.hold = true
+			return Enter().Lazy() // opened by the first write, if the message is written at all
+		}
 		return Enter() // every message is written (system stays in place)
 	case 3:
 		switch t.Last() {
@@ -345,6 +405,10 @@ func (p *qwenProto) OnValue(t *Transformer, raw []byte) {
 			p.toolsN = len(tools)
 		}
 	case 3:
+		if p.m.fold && t.Last() != "role" {
+			p.foldValue(t, t.Last(), raw)
+			return
+		}
 		switch t.Last() {
 		case "role":
 			s, ok := jsonUnquote(raw)
@@ -355,6 +419,27 @@ func (p *qwenProto) OnValue(t *Transformer, raw []byte) {
 			p.m.roleSeen = true
 			if s == "developer" && p.opt.DeveloperToSystem {
 				s = "system"
+			}
+			if p.m.hold {
+				if s == "system" && p.opt.MergeLeadingSystem {
+					// folded: whatever came before role is read for the fold, the rest of the message is captured
+					p.m.fold = true
+					for _, kv := range t.Deferred() {
+						p.foldValue(t, kv.Key, kv.Raw)
+					}
+					t.DropDeferred()
+					return
+				}
+				if s != "system" {
+					p.insertBefore(t)
+				} else {
+					p.insLeading++
+				}
+				p.m.hold = false
+				w.Key("role")
+				w.JSONString(s)
+				t.Release()
+				return
 			}
 			w.Key("role")
 			w.JSONString(s)
@@ -466,12 +551,26 @@ func (p *qwenProto) OnLeave(t *Transformer) {
 			t.Bail("no message found in the request body")
 			return
 		}
+		if p.insActive && !p.insInserted {
+			p.insertAtEnd(t)
+			if t.Dead() {
+				return
+			}
+		}
 		w.Open()
 		w.Pop()
 		w.Pop()
 	case 2:
 		m := &p.m
+		if m.fold { // a folded leading system message: kept, not written
+			p.insFolded = append(p.insFolded, leadSys{text: m.text, name: m.name, rc: m.rc, rich: m.rich})
+			return
+		}
 		m.finalizing = true
+		if m.hold { // no role at all: "" is not system, the insertion goes in front
+			m.hold = false
+			p.insertBefore(t)
+		}
 		if len(t.Deferred()) > 0 {
 			t.ReleaseNow()
 			if t.Dead() {
@@ -543,4 +642,102 @@ func parseFloat(raw []byte) (float64, error) {
 	var f float64
 	err := json.Unmarshal(raw, &f)
 	return f, err
+}
+
+// ---- InsertSystem ----
+
+// systemMessage is a qwenMessage with role system: name and reasoning_content only when set (omitempty).
+func systemMessage(name, content, rc string) []byte {
+	b := []byte(`{`)
+	if name != "" {
+		b = append(b, `"name":`...)
+		b = appendJSONString(b, name)
+		b = append(b, ',')
+	}
+	b = append(b, `"role":"system","content":`...)
+	b = appendJSONString(b, content)
+	if rc != "" {
+		b = append(b, `,"reasoning_content":`...)
+		b = appendJSONString(b, rc)
+	}
+	return append(b, '}')
+}
+
+// foldValue reads one key of a leading system message being folded.
+func (p *qwenProto) foldValue(t *Transformer, key string, raw []byte) {
+	m := &p.m
+	switch key {
+	case "content":
+		s, ok := jsonUnquote(raw)
+		if ok {
+			m.text = s
+			return
+		}
+		// StringContent on a converted multimodal content: the text fields concatenated; anything else is ""
+		var els []json.RawMessage
+		if err := json.Unmarshal(raw, &els); err == nil {
+			m.rich = true
+			for _, el := range els {
+				var part struct {
+					Text *string `json:"text"`
+				}
+				if err := json.Unmarshal(el, &part); err == nil && part.Text != nil {
+					m.text += *part.Text
+				}
+			}
+		}
+	case "name":
+		if s, ok := jsonUnquote(raw); ok {
+			m.name = s
+		}
+	case "reasoning_content":
+		if s, ok := jsonUnquote(raw); ok {
+			m.rc = s
+		}
+	case "tool_calls":
+		if string(raw) != "null" {
+			m.rich = true
+		}
+	}
+}
+
+// insertBefore writes the inserted message (and what precedes it) as the elements before the message being
+// scanned, whose own output level is still unopened.
+func (p *qwenProto) insertBefore(t *Transformer) {
+	w := t.W()
+	lvl := w.Level() - 1
+	if p.opt.MergeLeadingSystem && len(p.insFolded) > 0 {
+		texts := make([]string, 0, len(p.insFolded))
+		for _, l := range p.insFolded {
+			texts = append(texts, l.text)
+		}
+		w.ElemAt(lvl)
+		w.Raw(systemMessage("", strings.Join(texts, "\n"), ""))
+	} else if p.insLeading == 0 {
+		w.ElemAt(lvl)
+		w.Raw(systemMessage("", qwenDummySystemContent, ""))
+	}
+	w.ElemAt(lvl)
+	w.Raw(systemMessage("", *p.opt.InsertSystem, ""))
+	p.insInserted = true
+}
+
+// insertAtEnd: every message was system (or the array is empty). The buffered path puts the dummy and the
+// inserted message first, the system messages after them unmerged; here the ones written in place have gone
+// out, so they precede (a deviation), and the folded ones are written back after the insertion.
+func (p *qwenProto) insertAtEnd(t *Transformer) {
+	w := t.W()
+	w.Elem()
+	w.Raw(systemMessage("", qwenDummySystemContent, ""))
+	w.Elem()
+	w.Raw(systemMessage("", *p.opt.InsertSystem, ""))
+	for _, l := range p.insFolded {
+		if l.rich {
+			t.Bail("a leading system message with multimodal content or tool_calls and no other message: the fold cannot write it back")
+			return
+		}
+		w.Elem()
+		w.Raw(systemMessage(l.name, l.text, l.rc))
+	}
+	p.insInserted = true
 }

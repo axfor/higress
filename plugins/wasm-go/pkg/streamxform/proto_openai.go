@@ -77,6 +77,7 @@ type openaiProto struct {
 	ctxInserted bool
 	ctxRoleSeen bool
 	msgsSeen    bool
+	msgCount    int // elements of messages, when entered
 }
 
 // NewOpenAI builds the transformer of the OpenAI-compatible passthrough protocol.
@@ -98,7 +99,7 @@ func (p *openaiProto) Prelude() Prelude {
 }
 
 func (p *openaiProto) enterMessages() bool {
-	return (p.opt.CheckMessages && !p.opt.DeveloperRoleSupported) || p.scanReasoning || p.opt.InsertSystem != nil
+	return (p.opt.CheckMessages && !p.opt.DeveloperRoleSupported) || p.scanReasoning || p.opt.InsertSystem != nil || p.opt.ResponseFormat != nil
 }
 
 // contextMessage is the system message the setting `context` inserts.
@@ -201,6 +202,7 @@ func (p *openaiProto) OnKey(t *Transformer) Action {
 
 func (p *openaiProto) OnElem(t *Transformer) Action {
 	if t.Depth() == 2 {
+		p.msgCount++
 		p.msgRCSeen = false
 		p.ctxRoleSeen = false
 		if p.opt.InsertSystem != nil && !p.ctxInserted {
@@ -347,6 +349,10 @@ func (p *openaiProto) Tail(t *Transformer) {
 		w.JSONString(p.opt.MapModel(""))
 	}
 	if p.opt.ResponseFormat != nil {
+		if p.msgCount == 0 {
+			t.Bail("no message found in the request body: the buffered decode that sets response_format rejects it")
+			return
+		}
 		w.Key("response_format")
 		w.Raw(p.opt.ResponseFormat)
 	}

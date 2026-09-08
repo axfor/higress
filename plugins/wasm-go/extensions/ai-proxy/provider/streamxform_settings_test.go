@@ -286,6 +286,10 @@ func TestResponseJsonSchemaDifferential(t *testing.T) {
 		`{"model":"m1","messages":[{"role":"user","content":"` + strings.Repeat("r", 70000) + `"}],"response_format":{"type":"text"},"temperature":0.5}`,
 		`{"model":"m1","messages":[{"role":"system","content":"D"},{"role":"user","content":"U"}],"stream":true,"stream_options":{"include_usage":true}}`,
 		`{"model":"m1","messages":[{"role":"user","content":"U"}],"response_format":"bad"}`,
+		`{"model":"m1","messages":[]}`,
+		`{"model":"m1","messages":null}`,
+		`{"model":"m1"}`,
+		`{"model":"m1","messages":"str"}`,
 	} {
 		off, offOK := official(in)
 		for _, chunk := range []int{1, 7, 4096} {

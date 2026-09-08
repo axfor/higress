@@ -60,10 +60,10 @@ description: AI 代理插件配置参考
 - `responseJsonSchema`（openai / longcat）：配置的 schema 替换请求里的 `response_format`；全量路径顺带把整个请求经结构体重新序列化一遍（不认识的字段、零值的可选字段会被丢掉，`stream_options.include_usage: false` 会变成 true），流式不复刻这一步，其余原样透传。
 - `context`：文件内容已缓存（第一个请求走全量路径取文件）后，chat 请求流式插入：OpenAI 形态的 body（openai 兼容族、azure、qwen 兼容、zhipuai、openrouter、minimax v2、vertex OpenAI 兼容端点、Claude 协议入站转换后）在第一条非 system 消息之前插入 system 消息，为此每条消息在 role 到来之前的键有界暂存（64KB）；claude 把内容接在 system 前面（`内容\n原 system`）。偏差：全部消息都是 system 时全量路径把它放在最前，流式已放行这些消息、只能追加在最后；请求没有 system 消息时全量路径的 claude 插入会空指针崩溃，流式把内容作为 system。其它 body 形态（gemini、vertex Gemini 格式、bedrock 等）的 chat 仍走全量路径。
 - `mergeConsecutiveMessages`（含 `hiclawMode`）：管道里的一段，跑在供应商转换之前、Claude 协议入站转换之后（与全量路径同序）；每条消息整条有界持有（1MB）到下一条的 role 明确才决定合不合，合并规则与全量路径相同（含"数组合并后再合并只留最新一条 parts"的行为）；没合并过的消息原样放行；全量路径合并后对整个请求的结构体重序列化不复刻。`image_url.url` 等全量路径直接断言的字段缺失时回落（全量路径会 panic）。
+- qwen 原生协议的 `qwenFileIds`（模型映射后为 qwen-long 时）与 `context`：在第一条非 system 消息前插入文件列表 / 文件内容的 system 消息，第一条就是非 system 时先补一条 "You are a helpful assistant."；`qwenFileIds` 把前导 system 消息折成一条（文本按换行拼接）。每条消息在 role 到来前有界暂存（64KB）；`qwenFileIds` 要求 `model` 在 `messages` 之前（插不插取决于模型）。偏差：全部消息都是 system 时全量路径把补的两条放最前，流式追加在后（折叠模式下折起来的 system 消息跟在后面写回）。
 
 其余供应商（AK/SK 模式的 Bedrock、Hunyuan）以及配置了
-`contextCleanupCommands` / `retryOnFailure` /
-`qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
+`contextCleanupCommands` / `retryOnFailure`的场景，仍走原有的全量缓冲路径，行为不变。
 `firstByteTimeout` 在 chat 上照常生效（`stream` 须出现在窗口内，否则回落），`providerBasePath` 对所有供应商照常生效。
 
 运行指标：`ai_proxy.stream_xform.streamed` / `fallback` / `uncoverable` / `skipped` 四个计数器（Envoy 统计里带 `wasmcustom.` 前缀）（走流式 / 回落到全量 /

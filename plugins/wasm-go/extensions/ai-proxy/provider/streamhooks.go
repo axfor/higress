@@ -356,9 +356,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		if !isChat {
 			return nil, "native qwen protocol streams chat completion only"
 		}
-		if len(c.qwenFileIds) > 0 {
-			return nil, "qwenFileIds inserts file messages into messages"
-		}
 		mapStrict := func(m string) (string, error) {
 			if m == "" {
 				return "", errors.New("missing model in request")
@@ -369,13 +366,26 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			}
 			return mapped, nil
 		}
-		tr := streamxform.NewQwenNative(streamxform.QwenNativeOptions{
+		opts := streamxform.QwenNativeOptions{
 			MapModel:                 mapStrict,
 			SupportsPreserveThinking: qwenSupportsPreserveThinking,
 			EnableSearch:             c.qwenEnableSearch,
 			DeveloperToSystem:        !isDeveloperRoleSupported(c.typ),
-		})
-		p := checkChatRequestTypes(&StreamPlan{Tr: tr, ApplyStream: true, ApplyModel: true})
+		}
+		if len(c.qwenFileIds) > 0 {
+			// buildQwenTextGenerationRequest: for qwen-long the file list goes in as a system message, the leading
+			// system messages folded into one (insertHttpContextMessage with onlyOneSystemBeforeFile)
+			ids := make([]string, 0, len(c.qwenFileIds))
+			for _, id := range c.qwenFileIds {
+				ids = append(ids, "fileid://"+id)
+			}
+			files := strings.Join(ids, ",")
+			opts.InsertSystem, opts.MergeLeadingSystem, opts.InsertOnlyForModel = &files, true, qwenLongModelName
+		} else {
+			opts.InsertSystem = insertSystem // the setting context: qwenProvider.insertHttpContextMessage on the DashScope body
+		}
+		tr := streamxform.NewQwenNative(opts)
+		p := checkChatRequestTypes(&StreamPlan{Tr: tr, ApplyStream: true, ApplyModel: true, ContextHandled: true})
 		p.RequireModelBeforeCommit = true
 		p.RequireStreamBeforeCommit = true
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
