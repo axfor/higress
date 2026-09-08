@@ -1241,7 +1241,7 @@ func (c *ProviderConfig) handleRequestBody(
 		converter := &ClaudeToOpenAIConverter{}
 		body, err = converter.ConvertClaudeRequestToOpenAIWithOptions(body, ClaudeToOpenAIConvertOptions{
 			PreserveMessageReasoningContent: c.supportsMessageReasoningContent(),
-			DisableStreamUsageStats:          c.disableStreamUsageStats,
+			DisableStreamUsageStats:         c.disableStreamUsageStats,
 		})
 		if err != nil {
 			return types.ActionContinue, fmt.Errorf("failed to convert claude request to openai: %v", err)

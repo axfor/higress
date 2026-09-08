@@ -418,6 +418,17 @@ func applyStreamTuning(json gjson.Result) {
 			streamCommitWindowBytes = n
 		}
 	}
+	if v := json.Get("streamInflightBudgetBytes"); v.Exists() {
+		n := int(v.Int())
+		switch {
+		case n == 0:
+			admBudgetBytes = 32 << 20
+		case n < 1<<20 || n > 1<<30:
+			log.Errorf("streamInflightBudgetBytes %d out of range [1048576, 1073741824], keeping %d", n, admBudgetBytes)
+		default:
+			admBudgetBytes = n
+		}
+	}
 	if v := json.Get("streamTypeCheck"); v.Exists() {
 		streamTypeCheck = v.Bool()
 		provider.ChatRequestTypeCheck = streamTypeCheck
@@ -433,8 +444,8 @@ func applyStreamTuning(json gjson.Result) {
 			wrapper.GCWatchdogFloor = uint64(n)
 		}
 	}
-	log.Infof("streaming tuning: commit window %d bytes, gc floor %d bytes, root field type check %v",
-		effectiveCommitWindow(), wrapper.GCWatchdogFloor, streamTypeCheck)
+	log.Infof("streaming tuning: commit window %d bytes, in-flight budget %d bytes (limit %.0f uploads), gc floor %d bytes, root field type check %v",
+		effectiveCommitWindow(), admBudgetBytes, admLimit(), wrapper.GCWatchdogFloor, streamTypeCheck)
 }
 
 func effectiveCommitWindow() int {
@@ -452,9 +463,18 @@ func effectiveCommitWindow() int {
 // property of the data path, not of this plugin). Streaming therefore has to state the bound itself: past the
 // current limit, new requests take the buffered path, which is exactly how the plugin behaved before.
 //
-// The limit is a fixed number of in-flight streaming uploads per wasm VM (per Envoy worker). An adaptive
-// version is kept behind admAdaptive: every completed streaming request reports how long it took, the
-// shortest time ever seen (with slow decay, so the baseline follows the upstream) is the reference, and the
+// The bound is stated in bytes, not in requests, because bytes are what it is protecting. What one in-flight
+// upload holds is one commit window, so a limit expressed as a request count silently means something different
+// as soon as the window changes: 500 uploads is 32MB at the 64KB default and half a gigabyte at a 1MB window.
+// The number of admitted uploads is therefore derived, and the two knobs cannot contradict each other:
+//
+//	limit = admBudgetBytes / commit window
+//
+// At the defaults that is 32MB / 64KB = 512, which is where the previously hand-picked 500 came from -- it is
+// the same bound, now with a reason. Raising the window to 256KB lowers the limit to 128 on its own.
+//
+// An adaptive version is kept behind admAdaptive: every completed streaming request reports how long it took,
+// the shortest time ever seen (with slow decay, so the baseline follows the upstream) is the reference, and the
 // limit grows additively while requests finish quickly and is cut multiplicatively once they queue. It is off
 // by default: on the lab gateway it walked the limit up to admMax, and 1MB bodies at 400 concurrency then
 // showed a 1.6x larger Envoy heap (315-370MB of tcmalloc against 199-204MB) and a p99 of 37-42s against 15-18s,
@@ -467,13 +487,32 @@ const (
 
 var (
 	streamInflight int
-	admLimit       = 500.0 // current limit, in in-flight streaming uploads per wasm VM
+	// admBudgetBytes: how many bytes of in-flight streaming uploads one wasm VM may hold. This is the
+	// incremental part only -- the Go heap floor the watchdog keeps and whatever else the VM allocates sit
+	// on top of it.
+	admBudgetBytes = 32 << 20
+	admOverride    = 0.0 // >0 pins the limit to a request count and ignores the budget; adaptive writes here
 	admMin         = 50.0
 	admMax         = 4000.0
 	admAdaptive    = false // see above: adaptive costs Envoy heap and tail latency without buying throughput
 	admBaseline    int64   // shortest completion time observed, in nanoseconds
 	admDone        int
 )
+
+// admLimit is the number of in-flight streaming uploads this VM admits.
+func admLimit() float64 {
+	if admOverride > 0 {
+		return admOverride
+	}
+	n := float64(admBudgetBytes) / float64(effectiveCommitWindow())
+	if n < admMin {
+		n = admMin
+	}
+	if n > admMax {
+		n = admMax
+	}
+	return n
+}
 
 // admOnDone folds one request's completion time into the baseline, and into the limit when adaptive is on.
 func admOnDone(dur int64) {
@@ -490,15 +529,18 @@ func admOnDone(dur int64) {
 	if !admAdaptive {
 		return
 	}
+	if admOverride == 0 {
+		admOverride = admLimit() // start adapting from the derived bound
+	}
 	switch {
 	case dur <= admBaseline*admLatencyOK:
-		if admLimit < admMax {
-			admLimit++
+		if admOverride < admMax {
+			admOverride++
 		}
 	case dur > admBaseline*admLatencyBad:
-		admLimit *= 0.9
-		if admLimit < admMin {
-			admLimit = admMin
+		admOverride *= 0.9
+		if admOverride < admMin {
+			admOverride = admMin
 		}
 	}
 }
@@ -574,7 +616,7 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		streamXformCount("skipped")
 		return fallbackOnly()
 	}
-	if float64(streamInflight) >= admLimit {
+	if float64(streamInflight) >= admLimit() {
 		// Too many uploads in flight already: keep this one on the buffered path.
 		streamXformCount("admission_fallback")
 		return fallbackOnly()

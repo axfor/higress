@@ -105,3 +105,51 @@ func TestStreamTypeCheckSwitch(t *testing.T) {
 		t.Fatal("没写这个字段却被改动了")
 	}
 }
+
+// 准入上限必须跟着提交窗口走：受约束的是"在传请求数 × 每请求持有字节"，
+// 用请求数表达上限，窗口一变它就悄悄变成了另一个意思。
+func TestAdmissionLimitDerivedFromBudget(t *testing.T) {
+	log.SetPluginLog(quietLog{})
+	t.Cleanup(func() {
+		streamCommitWindowBytes, admBudgetBytes, admOverride = 0, 32<<20, 0
+	})
+
+	cases := []struct {
+		name      string
+		json      string
+		wantLimit float64
+	}{
+		{"默认 32MB / 64KB", `{}`, 512},
+		{"窗口翻四倍，上限降四倍", `{"streamCommitWindowBytes":262144}`, 128},
+		{"预算翻倍", `{"streamInflightBudgetBytes":67108864}`, 1024},
+		{"预算与窗口同时给", `{"streamInflightBudgetBytes":67108864,"streamCommitWindowBytes":262144}`, 256},
+		{"小预算撞下限", `{"streamInflightBudgetBytes":1048576,"streamCommitWindowBytes":1048576}`, admMin},
+		{"大预算撞上限", `{"streamInflightBudgetBytes":1073741824,"streamCommitWindowBytes":4096}`, admMax},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			streamCommitWindowBytes, admBudgetBytes, admOverride = 0, 32<<20, 0
+			applyStreamTuning(gjson.Parse(c.json))
+			if got := admLimit(); got != c.wantLimit {
+				t.Errorf("上限 = %.0f，应为 %.0f（窗口 %d，预算 %d）",
+					got, c.wantLimit, effectiveCommitWindow(), admBudgetBytes)
+			}
+		})
+	}
+}
+
+// 无论怎么配，在传请求持有的字节都不该超过预算 —— 这是这个上限存在的全部理由。
+func TestAdmissionBudgetIsNeverExceeded(t *testing.T) {
+	log.SetPluginLog(quietLog{})
+	t.Cleanup(func() { streamCommitWindowBytes, admBudgetBytes, admOverride = 0, 32<<20, 0 })
+	for _, win := range []int{4 << 10, 16 << 10, 64 << 10, 256 << 10, 1 << 20} {
+		for _, budget := range []int{4 << 20, 32 << 20, 128 << 20} {
+			streamCommitWindowBytes, admBudgetBytes, admOverride = win, budget, 0
+			held := admLimit() * float64(win)
+			// 撞到 admMin 时会超预算：那是刻意的下限，不能让上限低到完全不放行
+			if held > float64(budget) && admLimit() != admMin {
+				t.Errorf("窗口 %d 预算 %d：持有 %.0f 字节超出预算", win, budget, held)
+			}
+		}
+	}
+}

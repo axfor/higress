@@ -51,27 +51,16 @@ type Plan struct {
 
 // State is the driving state of one request.
 type State struct {
-	plan      *Plan
-	total     int
-	fallback  bool
-	sent      bool
-	raw       bool   // PrefixTransform: released, the rest is forwarded verbatim
-	dead      bool   // Observe: observation stopped
-	out       []byte // output of the current Feed when the transformer had to build one
-	unchanged bool   // this Feed produced exactly the bytes it was handed: forward them, replace nothing
-	pre       streamxform.Prelude
-	preKept   bool // pre holds the prelude captured when the transformer was dropped
+	plan     *Plan
+	total    int
+	fallback bool
+	sent     bool
+	raw      bool   // PrefixTransform: released, the rest is forwarded verbatim
+	dead     bool   // Observe: observation stopped
+	out      []byte // output of the current Feed when the transformer had to build one
+	pre      streamxform.Prelude
+	preKept  bool // pre holds the prelude captured when the transformer was dropped
 }
-
-// UnchangedFastPath forwards the caller's own bytes for a chunk the transformer did not change, so the driver
-// can skip replacing the host buffer.
-//
-// It is off because it has not been shown to pay. The wrapper already skips the host replace when the bytes it
-// gets back equal the ones it handed in, so this flag only saves that comparison and one buffer append. Paired
-// runs on the gateway put every difference inside run-to-run noise: at 70KB x 800 concurrency 559-755 QPS with
-// it against 632-676 without, at 1MB x 400 concurrency 44-64 QPS against 29-54, with Envoy's heap flat at
-// 199-241MB throughout. Turn it on only with a measurement that separates it from that noise.
-var UnchangedFastPath = false
 
 // New builds the driving state.
 //
@@ -188,7 +177,7 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		}
 		return chunk, types.ActionContinue
 	}
-	s.out, s.unchanged = s.out[:0], false
+	s.out = s.out[:0]
 	tr.Write(chunk)
 	if last {
 		tr.Finish() // the remaining output arrives through the sink as well
@@ -219,13 +208,6 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		s.metric("streamed")
 	}
 	out := s.out
-	if UnchangedFastPath && tr.Unchanged() && !last {
-		// The transformer produced exactly the bytes it was handed. Forward the caller's own chunk and let the
-		// driver skip ReplaceHttpRequestBody entirely: no copy, no allocation, and nothing for the next filter
-		// in the chain to trip over.
-		s.unchanged = true
-		out = chunk
-	}
 	if last {
 		if s.plan.OnFinish != nil {
 			s.plan.OnFinish(Prelude(tr))
@@ -279,10 +261,6 @@ func (s *State) feedFallback(last bool) ([]byte, types.Action) {
 	}
 	return nb, types.ActionContinue
 }
-
-// Unchanged reports that the bytes returned by the last Feed are the caller's own chunk, so the host buffer
-// does not need to be replaced.
-func (s *State) Unchanged() bool { return s.unchanged }
 
 // Sent reports whether anything has been released (request headers sent).
 func (s *State) Sent() bool { return s.sent }
