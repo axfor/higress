@@ -24,7 +24,7 @@ import (
 
 // StreamPlan is the streaming plan of one request.
 type StreamPlan struct {
-	Tr *streamxform.Transformer
+	Tr streamxform.Xform // a Transformer, or a Pipeline of two
 	// Passthrough: the buffered path does not touch the body at all (generic); chunks are released directly without a transformer.
 	Passthrough bool
 	// ApplyStream: the buffered path sets the Accept header and isStreaming according to stream
@@ -161,7 +161,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return nil, "retryOnFailure needs the whole body stored in the context"
 	}
 	if need, _ := ctx.GetContext("needClaudeResponseConversion").(bool); need {
-		return nil, "automatic conversion of Claude protocol input"
+		return c.claudeInputPlan(ctx, apiName, prov)
 	}
 	if !c.isSupportedAPI(apiName) {
 		return nil, "apiName not supported"
@@ -549,17 +549,17 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 				return nil, err.Error()
 			}
 			if strings.HasPrefix(mapped, "claude") {
-				return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewClaude(streamxform.ClaudeOptions{
+				return chatTyped(streamxform.NewClaude(streamxform.ClaudeOptions{
 					MapModel: mapStrict, ClaudeCodeMode: c.claudeCodeMode, OmitModel: true, AnthropicVersion: vertexAnthropicVersion,
 					KeepDeveloperRole: true, // vertex's handler does not run convertDeveloperRoleToSystem
-				})}).Tr, ""
+				})), ""
 			}
 			var ss []streamxform.GeminiSafetySetting
 			for k, v := range c.geminiSafetySetting {
 				ss = append(ss, streamxform.GeminiSafetySetting{Category: k, Threshold: v})
 			}
 			sort.Slice(ss, func(i, j int) bool { return ss[i].Category < ss[j].Category })
-			return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewVertexGemini(streamxform.VertexGeminiOptions{
+			return chatTyped(streamxform.NewVertexGemini(streamxform.VertexGeminiOptions{
 				MapModel:       mapStrict,
 				SafetySettings: ss,
 				ApplyResponseFormat: func(rf map[string]any, mapped string) (string, map[string]any, error) {
@@ -570,7 +570,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 					return cfg.ResponseMimeType, cfg.ResponseSchema, nil
 				},
 				DetectMime: detectMimeTypeFromURL,
-			})}).Tr, ""
+			})), ""
 		}
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
@@ -726,6 +726,9 @@ var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
 // Depth 6 covers chatCompletionRequest down to functionCall, which is as deep as it goes.
 var chatRequestFieldTree = streamxform.FieldTreeOf(&chatCompletionRequest{}, 6)
 
+// claudeRequestFieldTree is what the automatic Claude → OpenAI conversion decodes into.
+var claudeRequestFieldTree = streamxform.FieldTreeOf(&claudeTextGenRequest{}, 6)
+
 // The non-chat endpoints decode into their own structs; their trees serve the same purpose.
 var embeddingsFieldTree = streamxform.FieldTreeOf(&embeddingsRequest{}, 3)
 var imageGenerationFieldTree = streamxform.FieldTreeOf(&imageGenerationRequest{}, 3)
@@ -734,6 +737,14 @@ var imageGenerationFieldTree = streamxform.FieldTreeOf(&imageGenerationRequest{}
 // decode into the struct -- claude, gemini and native qwen. The rest go through defaultTransformRequestBody,
 // which reads the body with gjson and type-checks nothing; adding the check there would make the streaming
 // path stricter than the buffered one, which is a deviation in the other direction.
+// chatTyped is checkChatRequestTypes for a bare transformer (a replan result).
+func chatTyped(tr *streamxform.Transformer) *streamxform.Transformer {
+	if tr != nil && ChatRequestTypeCheck {
+		tr.SetFieldTree(chatRequestFieldTree)
+	}
+	return tr
+}
+
 func checkChatRequestTypes(p *StreamPlan) *StreamPlan {
 	if p != nil && p.Tr != nil && ChatRequestTypeCheck {
 		p.Tr.SetFieldTree(chatRequestFieldTree) // the tree carries the root fields' own types as well
@@ -773,6 +784,39 @@ func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName 
 	if plan.ApplyStream && !pre.StreamSeen {
 		ctx.SetContext(ctxKeyIsStreaming, false)
 	}
+}
+
+// claudeInputPlan streams the automatic Claude → OpenAI protocol conversion: handleRequestBody converts the body
+// with ConvertClaudeRequestToOpenAIWithOptions, strips the Claude-internal fields again for every provider but
+// bedrock and claude, and hands the result to the provider's own transform. That is two transforms in series, a
+// Pipeline: the conversion first, the provider's default OpenAI transformer second. Only the OpenAI-compatible
+// family that goes through defaultTransformRequestBody is covered; the providers whose variants read the
+// thinking context keys the buffered path sets from the Claude body keep the buffered path.
+func (c *ProviderConfig) claudeInputPlan(ctx wrapper.HttpContext, apiName ApiName, prov Provider) (*StreamPlan, string) {
+	if apiName != ApiNameChatCompletion {
+		return nil, "automatic conversion of Claude protocol input on an endpoint other than chat"
+	}
+	if !(c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat || c.typ == providerTypeDoubao || streamDefaultProviders[c.typ]) {
+		return nil, "automatic conversion of Claude protocol input for a provider with its own conversion"
+	}
+	if (c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat) && c.responseJsonSchema != nil {
+		return nil, "responseJsonSchema is re-serialized through a struct"
+	}
+	first := streamxform.NewClaudeToOpenAI(streamxform.ClaudeToOpenAIOptions{
+		PreserveReasoning:       c.supportsMessageReasoningContent(),
+		DisableStreamUsageStats: c.disableStreamUsageStats,
+	})
+	if ChatRequestTypeCheck {
+		first.SetFieldTree(claudeRequestFieldTree)
+	}
+	second := streamxform.NewOpenAI(streamxform.OpenAIOptions{
+		MapModel:               func(m string) string { return getMappedModel(m, c.modelMapping) },
+		DetectStream:           true,
+		NormalizeUsage:         c.IsOpenAIProtocol() && !c.disableStreamUsageStats,
+		DeveloperRoleSupported: isDeveloperRoleSupported(c.typ),
+		CheckMessages:          true,
+	})
+	return &StreamPlan{Tr: streamxform.NewPipeline(first, second), ApplyStream: true, ApplyModel: true}, ""
 }
 
 // bodyPhasePath reproduces what handleRequestBody does to a path a TransformRequestBodyHeaders handler set: the

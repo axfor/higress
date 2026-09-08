@@ -29,7 +29,7 @@ const (
 
 // Plan describes the streaming handling of one request.
 type Plan struct {
-	Tr   *streamxform.Transformer
+	Tr   streamxform.Xform // a Transformer, or a Pipeline of two
 	Mode Mode
 	// Passthrough: the buffered path does not touch the body at all; chunks are released directly without the transformer (Tr may be nil).
 	Passthrough bool
@@ -97,7 +97,7 @@ func New(p *Plan) *State {
 
 // attach wires a transformer into this state: the key cache shared by the VM and, outside Observe and
 // passthrough, the sink that collects its output into out.
-func (s *State) attach(tr *streamxform.Transformer) {
+func (s *State) attach(tr streamxform.Xform) {
 	s.plan.Tr = tr
 	tr.SetKeyCache(keyCache)
 	if s.plan.Mode != Observe && !s.plan.Passthrough {
@@ -115,7 +115,7 @@ func (s *State) prelude() streamxform.Prelude {
 }
 
 // Prelude returns the Prelude reported by the transformer's protocol (zero value when it does not implement Preluder).
-func Prelude(tr *streamxform.Transformer) streamxform.Prelude {
+func Prelude(tr streamxform.Xform) streamxform.Prelude {
 	if tr == nil {
 		return streamxform.Prelude{}
 	}
@@ -147,7 +147,7 @@ func (s *State) bailed(kind, code string) {
 }
 
 // codeOf returns the code name of the transformer's bail.
-func codeOf(tr *streamxform.Transformer) string {
+func codeOf(tr streamxform.Xform) string {
 	if tr == nil || tr.Err() == nil {
 		return "none"
 	}

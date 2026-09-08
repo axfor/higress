@@ -691,8 +691,7 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 			return tr, why
 		}
 	}
-	x.st = guard.New(&guard.Plan{
-		Tr:          plan.Tr,
+	gp := &guard.Plan{
 		Mode:        guard.Transform,
 		Passthrough: plan.Passthrough,
 		OnCommit:    x.onCommit,
@@ -705,7 +704,11 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		},
 		Metric: streamXformCount,
 		Log:    log.Warnf,
-	})
+	}
+	if plan.Tr != nil {
+		gp.Tr = plan.Tr // a nil transformer must stay a nil interface, not a typed nil inside one
+	}
+	x.st = guard.New(gp)
 	return x
 }
 

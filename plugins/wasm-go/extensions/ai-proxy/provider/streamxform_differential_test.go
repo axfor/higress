@@ -83,7 +83,7 @@ func fuzzSeed() int64 {
 }
 
 func typed(tr *streamxform.Transformer) *streamxform.Transformer {
-	return checkChatRequestTypes(&StreamPlan{Tr: tr}).Tr
+	return chatTyped(tr)
 }
 
 func runStream(tr *streamxform.Transformer, in string, chunk int) (map[string]any, bool, string) {

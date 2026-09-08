@@ -692,3 +692,51 @@ func TestStreamingRequest_ProviderBasePath(t *testing.T) {
 		}
 	})
 }
+
+var streamingOpenAIForClaudeInputConfig = json.RawMessage(`{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"claude-3":"gpt-4o"}}}`)
+
+// A Claude request to an OpenAI provider: converted to OpenAI in the engine, then the provider's own transform.
+func TestStreamingRequest_ClaudeInputToOpenAI(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingOpenAIForClaudeInputConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/messages"))
+
+		// many medium messages: each is held whole and converted when it closes, so the output grows as they come
+		var turns []string
+		for i := 0; i < 40; i++ {
+			role := "user"
+			if i%2 == 1 {
+				role = "assistant"
+			}
+			turns = append(turns, `{"role":"`+role+`","content":"`+strings.Repeat("k", 3000)+`"}`)
+		}
+		body := `{"model":"claude-3","max_tokens":64,"stream":true,"system":"S","messages":[` + strings.Join(turns, ",") + `,{"role":"assistant","content":[{"type":"text","text":"calling"},{"type":"tool_use","id":"t1","name":"f","input":{"a":1}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"r1"}]}],"thinking":{"type":"enabled","budget_tokens":2048}}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		require.Equal(t, types.ActionContinue, actions[len(actions)*3/4], "released past the window: streamed, not buffered")
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out), truncate(upstream))
+		require.Equal(t, "gpt-4o", out["model"])
+		require.Equal(t, true, out["stream"])
+		require.Equal(t, map[string]any{"include_usage": true}, out["stream_options"])
+		require.Equal(t, float64(64), out["max_tokens"])
+		require.Equal(t, "low", out["reasoning_effort"])
+		msgs := out["messages"].([]any)
+		require.Len(t, msgs, 43)
+		require.Equal(t, "system", msgs[0].(map[string]any)["role"])
+		require.Equal(t, strings.Repeat("k", 3000), msgs[1].(map[string]any)["content"])
+		require.Equal(t, "calling", msgs[41].(map[string]any)["content"])
+		require.Len(t, msgs[41].(map[string]any)["tool_calls"].([]any), 1)
+		require.Equal(t, "tool", msgs[42].(map[string]any)["role"])
+		require.Equal(t, "t1", msgs[42].(map[string]any)["tool_call_id"])
+		_, hasBlocks := msgs[41].(map[string]any)["claude_content_blocks"]
+		require.False(t, hasBlocks, "internal fields are stripped for an OpenAI provider")
+		_, hasThinking := out["claude_thinking"]
+		require.False(t, hasThinking)
+		require.Equal(t, "/v1/chat/completions", requestHeader(host, ":path"))
+		require.Equal(t, "api.openai.com", requestHeader(host, ":authority"))
+	})
+}
