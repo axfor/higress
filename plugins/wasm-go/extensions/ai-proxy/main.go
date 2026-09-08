@@ -584,11 +584,6 @@ func admDivert(ctx wrapper.HttpContext) bool {
 // onStreamDone releases the admission slot. It runs even when the client aborts mid-upload, which the body
 // hooks do not see; without it a few aborted requests would leak slots and pin the plugin to the buffered path.
 func onStreamDone(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) {
-	// A stream the client dropped mid-upload never reaches its last chunk, so Feed never returns its output
-	// buffer to the free list; hand it back here. Idempotent, so a normally finished stream is unaffected.
-	if x, _ := ctx.GetContext(ctxKeyXformState).(*xformState); x != nil && x.st != nil {
-		x.st.Release()
-	}
 	if admitted, _ := ctx.GetContext(ctxKeyAdmitted).(bool); admitted {
 		ctx.SetContext(ctxKeyAdmitted, false)
 		if streamInflight > 0 {
