@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"strings"
 	"testing"
 
@@ -1105,5 +1107,53 @@ func TestStreamingRequest_QwenNativeInsert(t *testing.T) {
 			require.NoError(t, json.Unmarshal(upstream, &out), truncate(upstream))
 			check(out)
 		}()
+	})
+}
+
+// A multipart image edit on the default path: the model field is mapped and the body streams; with a mapping that
+// changes nothing it passes through untouched.
+func TestStreamingRequest_MultipartImageEdit(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		const boundary = "----HigressBoundaryTest"
+		build := func(model string) []byte {
+			var buf bytes.Buffer
+			w := multipart.NewWriter(&buf)
+			require.NoError(t, w.SetBoundary(boundary))
+			require.NoError(t, w.WriteField("model", model))
+			require.NoError(t, w.WriteField("prompt", "make it blue"))
+			f, err := w.CreateFormFile("image", "a.png")
+			require.NoError(t, err)
+			_, _ = f.Write([]byte(strings.Repeat("\x89PNG\r\n--not-a-boundary\r\n", 12000))) // ~300KB
+			require.NoError(t, w.Close())
+			return buf.Bytes()
+		}
+		for _, c := range []struct {
+			name, model, wantModel string
+			changed                bool
+		}{
+			{"mapped", "m", "gpt-image-1", true},
+			{"unchanged", "gpt-image-1", "gpt-image-1", false},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(json.RawMessage(`{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"m":"gpt-image-1"}}}`))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status, c.name)
+				hdrs := streamingRequestHeaders("/v1/images/edits")
+				for i := range hdrs {
+					if hdrs[i][0] == "Content-Type" {
+						hdrs[i][1] = "multipart/form-data; boundary=" + boundary
+					}
+				}
+				host.CallOnHttpRequestHeaders(hdrs)
+				body := build(c.model)
+				actions, upstream := feedChunks(host, body, 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-2], "%s: released past the window", c.name)
+				// the buffered re-encoding of a body Go's writer produced is that body with the field replaced
+				require.Equal(t, string(build(c.wantModel)), string(upstream), c.name)
+				require.Equal(t, c.changed, !bytes.Equal(body, upstream), c.name)
+				require.Equal(t, "/v1/images/edits", requestHeader(host, ":path"), c.name)
+			}()
+		}
 	})
 }

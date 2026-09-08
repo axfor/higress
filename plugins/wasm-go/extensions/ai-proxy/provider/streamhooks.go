@@ -61,6 +61,8 @@ type StreamPlan struct {
 	// MergeHandled: the plan already placed the mergeConsecutiveMessages stage where the buffered path runs it
 	// (between the Claude-input conversion and the provider's transformer); other chat plans get it in front.
 	MergeHandled bool
+	// Multipart: the body is multipart/form-data, not JSON; the JSON stages do not apply to it.
+	Multipart bool
 }
 
 // streamDefaultProviders are the providers that go through defaultTransformRequestBody
@@ -91,6 +93,36 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return nil, why
 	}
 	return c.withContext(plan, apiName)
+}
+
+// multipartPlan streams a multipart/form-data body where the buffered path only maps the model field: image edits
+// and variations on the providers whose TransformRequestBody is the default one. The other providers parse the
+// form into a JSON request of their own (Vertex, Gemini) and keep the buffered path, as does everything the
+// header phase already declined.
+func (c *ProviderConfig) multipartPlan(apiName ApiName, contentType string) (*StreamPlan, string) {
+	if !isMultipartFormData(contentType) {
+		return nil, ""
+	}
+	if apiName != ApiNameImageEdit && apiName != ApiNameImageVariation {
+		return nil, ""
+	}
+	if !(c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat || c.typ == providerTypeDoubao || streamDefaultProviders[c.typ]) {
+		return nil, "multipart image edits on a provider that rebuilds the request keep the buffered path"
+	}
+	if len(c.customSettings) > 0 {
+		return nil, "customSettings on a multipart body keeps the buffered path"
+	}
+	boundary, err := parseMultipartBoundary(contentType)
+	if err != nil {
+		return nil, "multipart boundary: " + err.Error()
+	}
+	tr := streamxform.NewMultipart(streamxform.MultipartOptions{
+		Boundary: boundary,
+		MapModel: func(m string) string { return getMappedModel(m, c.modelMapping) },
+	})
+	// the model field has to be within the window: the context keys the buffered path writes need it, and the
+	// rendering (untouched or re-encoded) is only known from it
+	return &StreamPlan{Tr: tr, ApplyModel: true, RequireModelBeforeCommit: true, Multipart: true}, ""
 }
 
 // withMerge reproduces handleRequestBody's mergeConsecutiveMessages on chat: a stage in front of the provider's
@@ -148,6 +180,9 @@ func (c *ProviderConfig) streamContextContent() *string {
 func (c *ProviderConfig) withCustomSettings(p *StreamPlan) (*StreamPlan, string) {
 	if len(c.customSettings) == 0 {
 		return p, ""
+	}
+	if p.Multipart {
+		return nil, "customSettings on a multipart body keeps the buffered path"
 	}
 	settings, why := c.streamSettings()
 	if why != "" {
@@ -289,6 +324,9 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return nil, "the buffered path does not handle the request body for this apiName"
 	}
 	if ct, _ := proxywasm.GetHttpRequestHeader("content-type"); !strings.Contains(ct, "application/json") {
+		if p, why := c.multipartPlan(apiName, ct); p != nil || why != "" {
+			return p, why
+		}
 		return nil, "non-JSON request body (multipart etc.) takes the buffered path"
 	}
 	isChat := apiName == ApiNameChatCompletion
