@@ -496,7 +496,8 @@ var (
 	streamInflight int
 	// admBudgetBytes: how many bytes of in-flight streaming uploads one wasm VM may hold. This is the
 	// incremental part only -- the Go heap floor the watchdog keeps and whatever else the VM allocates sit
-	// on top of it.
+	// on top of it -- and it is per VM, which means per Envoy worker: a gateway of three replicas with two
+	// workers each holds six times this, so the cluster-wide figure is the one to size against a pod limit.
 	admBudgetBytes = 32 << 20
 	admOverride    = 0.0 // >0 pins the limit to a request count and ignores the budget; adaptive writes here
 	admMin         = 50.0
