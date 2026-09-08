@@ -167,3 +167,47 @@ func TestMetricsByCode(t *testing.T) {
 		t.Fatalf("observe mode: out=%q metrics=%v", out, *got)
 	}
 }
+
+// The host can deliver the whole body before it signals the end of the stream: Envoy calls the body hook once
+// more with an empty chunk and end_of_stream set. PrefixTransform used to drop the transformer as soon as it
+// released, so the bytes the engine still held for Finish (the root's closing brace and any trailing
+// whitespace) never reached the upstream and the body arrived truncated.
+func TestPrefixTransformEndOfStreamArrivesEmpty(t *testing.T) {
+	// Chunked the way Envoy delivers a 70KB body: the third chunk both crosses the 64KB commit point and
+	// carries the closing brace, so the release and the end of the root happen in the same call.
+	body := []byte(`{"model":"p/m1","messages":[{"role":"user","content":"` + big(70000) + `"}]}` + "\n")
+	stubHost(t, body)
+	tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{MapModel: func(m string) string {
+		if i := strings.Index(m, "/"); i >= 0 {
+			return m[i+1:]
+		}
+		return m
+	}})
+	s := New(&Plan{Tr: tr, Mode: PrefixTransform,
+		OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen },
+	})
+	// The exact split Envoy produced on the gateway: the first two chunks stay just under the 64KB commit
+	// point, so the third one crosses it and carries the closing brace at once.
+	var out []byte
+	for _, part := range [][]byte{body[:32585], body[32585:65353], body[65353:]} {
+		o, _ := s.Feed(part, false) // never the last chunk: the end of the stream arrives on its own
+		out = append(out, o...)
+	}
+	o, a := s.Feed(nil, true)
+	out = append(out, o...)
+	if a != types.ActionContinue {
+		t.Fatalf("the end-of-stream call must continue, got %v", a)
+	}
+	want := strings.Replace(string(body), `"model":"p/m1"`, `"model":"m1"`, 1)
+	if string(out) != want {
+		t.Fatalf("body truncated: got %d bytes, want %d; tail %q vs %q",
+			len(out), len(want), tailOf(string(out)), tailOf(want))
+	}
+}
+
+func tailOf(s string) string {
+	if len(s) > 24 {
+		return s[len(s)-24:]
+	}
+	return s
+}

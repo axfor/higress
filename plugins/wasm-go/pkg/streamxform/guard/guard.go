@@ -219,8 +219,14 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		if s.plan.OnFinish != nil {
 			s.plan.OnFinish(Prelude(tr))
 		}
-	} else if s.plan.Mode == PrefixTransform {
-		s.raw = true // rewrites only happen at the start: forward the rest verbatim, no more scanning
+	} else if s.plan.Mode == PrefixTransform && !tr.RootDone() {
+		// Rewrites only happen at the start, so once the prefix is released the rest can be forwarded
+		// verbatim and the transformer dropped -- but only while the engine has no bytes left to give.
+		// After the root value ends, its closing token and any trailing whitespace are written by Finish,
+		// so dropping the transformer here would send the body upstream without them. When a chunk crosses
+		// the commit point and carries the end of the root at once (a 70KB body arriving in three pieces
+		// does exactly that), the transformer has to stay for the end-of-stream call.
+		s.raw = true
 		s.plan.Tr = nil
 	}
 	return out, types.ActionContinue
