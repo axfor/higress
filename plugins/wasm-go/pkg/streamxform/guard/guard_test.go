@@ -484,7 +484,7 @@ func TestReplanRestartsTheChosenTransformerFromTheFirstByte(t *testing.T) {
 			Tr:       streamxform.NewKeyProbe(streamxform.KeyProbeOptions{Keys: map[string]int{"model": 4096}, ModelKey: "model", Observe: true}),
 			Mode:     Transform,
 			OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen },
-			Replan: func(pre streamxform.Prelude) (*streamxform.Transformer, string) {
+			Replan: func(pre streamxform.Prelude) (streamxform.Xform, string) {
 				r.replans++
 				if !choose {
 					return nil, "no transformer for this model"

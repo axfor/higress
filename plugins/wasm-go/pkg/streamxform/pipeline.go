@@ -29,20 +29,21 @@ var _ Xform = (*Pipeline)(nil)
 // This is what a buffered path that transforms twice needs (Claude protocol input converted to OpenAI, then the
 // provider's own conversion): each stage stays the protocol it is, and the pipeline is the composition.
 type Pipeline struct {
-	first, second *Transformer
+	first  *Transformer
+	second Xform
 }
 
 // NewPipeline composes first then second. The first stage's own commit window is set to one byte: it holds
 // nothing back, the second stage's window is the one that counts.
-func NewPipeline(first, second *Transformer) *Pipeline {
+func NewPipeline(first *Transformer, second Xform) *Pipeline {
 	p := &Pipeline{first: first, second: second}
 	first.SetCommitBytes(1)
 	first.SetSink(func(b []byte) { second.Write(b) })
 	return p
 }
 
-// Stages returns the two transformers, for callers that need to configure one of them.
-func (p *Pipeline) Stages() (first, second *Transformer) { return p.first, p.second }
+// Stages returns the two stages, for callers that need to configure one of them. The second may itself be a Pipeline.
+func (p *Pipeline) Stages() (first *Transformer, second Xform) { return p.first, p.second }
 
 func (p *Pipeline) Write(b []byte) {
 	if bad, _ := p.first.Unsupported(); bad {

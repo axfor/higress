@@ -828,3 +828,93 @@ func TestStreamingRequest_VertexImagesFallback(t *testing.T) {
 		require.Equal(t, "/v1/publishers/google/models/gemini-2.5-flash-image:generateContent?key=vk", requestHeader(host, ":path"))
 	})
 }
+
+// customSettings: the settings stage runs in front of every plan, as ReplaceByCustomSettings runs before every
+// handler. One config per plan kind: a conversion (claude), a passthrough (native gemini under the original
+// protocol, where the names are adjusted to gemini's), the Claude-input pipeline (three stages), and a replan (vertex).
+func TestStreamingRequest_CustomSettings(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		big := strings.Repeat("s", 100000)
+		// the Claude-input stage holds each message whole (and all of them until system, which comes first here):
+		// many medium messages release as they close
+		var msgs []string
+		for i := 0; i < 40; i++ {
+			role := "user"
+			if i%2 == 1 {
+				role = "assistant"
+			}
+			msgs = append(msgs, `{"role":"`+role+`","content":"`+strings.Repeat("t", 4000)+`"}`)
+		}
+		turns := strings.Join(msgs, ",")
+		for _, c := range []struct {
+			name, cfg, endpoint, body string
+			check                     func(out map[string]any)
+			path                      string
+		}{
+			{"claude", `{"provider":{"type":"claude","apiTokens":["sk-test"],"modelMapping":{"m":"claude-3"},"customSettings":[{"name":"max_tokens","value":100,"overwrite":false},{"name":"temperature","value":0.3},{"name":"stop","value":["END"],"mode":"raw"},{"name":"top_k","value":5,"mode":"raw"}]}}`,
+				"/v1/chat/completions", `{"model":"m","temperature":1,"messages":[{"role":"user","content":"` + big + `"}],"max_tokens":50,"stop":["X"]}`,
+				func(out map[string]any) {
+					require.Equal(t, float64(50), out["max_tokens"], "present: not overwritten")
+					require.Equal(t, 0.3, out["temperature"], "overwritten")
+					require.Equal(t, []any{"END"}, out["stop_sequences"], "overwritten on the OpenAI body, converted")
+					_, hasTopK := out["top_k"]
+					require.False(t, hasTopK, "set on the OpenAI body, dropped by the conversion as buffered")
+					require.Equal(t, "claude-3", out["model"])
+				}, "/v1/messages"},
+			{"gemini original", `{"provider":{"type":"gemini","apiTokens":["g-key"],"protocol":"original","customSettings":[{"name":"max_tokens","value":64},{"name":"temperature","value":0.9,"overwrite":false}]}}`,
+				"/v1beta/models/gemini-2.0-flash:generateContent", `{"contents":[{"role":"user","parts":[{"text":"` + big + `"}]}],"generation_config":{"temperature":0.2,"maxOutputTokens":1}}`,
+				func(out map[string]any) {
+					require.Equal(t, map[string]any{"temperature": 0.2, "maxOutputTokens": float64(64)}, out["generation_config"])
+					require.Len(t, out["contents"].([]any), 1)
+				}, "/v1beta/models/gemini-2.0-flash:generateContent"},
+			{"claude input pipeline", `{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"claude-3":"gpt-4o"},"customSettings":[{"name":"max_tokens","value":77},{"name":"temperature","value":0.5,"overwrite":false}]}}`,
+				"/v1/messages", `{"model":"claude-3","system":"S","max_tokens":10,"messages":[` + turns + `],"temperature":0.1}`,
+				func(out map[string]any) {
+					require.Equal(t, float64(77), out["max_tokens"], "set on the Claude body before the conversion")
+					require.Equal(t, 0.1, out["temperature"])
+					require.Equal(t, "gpt-4o", out["model"])
+					require.Len(t, out["messages"].([]any), 41)
+				}, "/v1/chat/completions"},
+			{"vertex replan", `{"provider":{"type":"vertex","apiTokens":["vk"],"modelMapping":{"m":"claude-sonnet-4@20250514"},"customSettings":[{"name":"temperature","value":0.5},{"name":"max_tokens","value":99,"overwrite":false}]}}`,
+				"/v1/chat/completions", `{"model":"m","stream":true,"messages":[{"role":"user","content":"` + big + `"}],"temperature":1}`,
+				func(out map[string]any) {
+					require.Equal(t, 0.5, out["temperature"])
+					require.Equal(t, float64(99), out["max_tokens"])
+					require.Equal(t, "vertex-2023-10-16", out["anthropic_version"])
+					require.Equal(t, true, out["stream"])
+				}, "/v1/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict?key=vk"},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(json.RawMessage(c.cfg))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status, c.name)
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders(c.endpoint))
+				actions, upstream := feedChunks(host, []byte(c.body), 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-2], "%s: released past the window", c.name)
+				var out map[string]any
+				require.NoError(t, json.Unmarshal(upstream, &out), "%s: %s", c.name, truncate(upstream))
+				c.check(out)
+				require.Equal(t, c.path, requestHeader(host, ":path"), c.name)
+			}()
+		}
+	})
+}
+
+// A customSettings path the stage does not take (an array index) keeps the buffered path, which still applies it.
+func TestStreamingRequest_CustomSettingsFallback(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(json.RawMessage(`{"provider":{"type":"claude","apiTokens":["sk-test"],"modelMapping":{"m":"claude-3"},"customSettings":[{"name":"stop.0","value":"END","mode":"raw"}]}}`))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+		body := `{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("f", 100000) + `"}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		for i, a := range actions[:len(actions)-1] {
+			require.Equal(t, types.ActionPause, a, "chunk %d: held for the buffered path", i)
+		}
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, []any{"END"}, out["stop_sequences"])
+	})
+}

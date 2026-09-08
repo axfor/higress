@@ -51,7 +51,7 @@ type Plan struct {
 	// far, read back from the host buffer where they still sit, before carrying on with it. Until then the
 	// plan's transformer only has to find model; a key probe does. Returning nil asks for the buffered path.
 	// Asked at most once. Model not seen before the release point is the plan's OnCommit to refuse.
-	Replan func(pre streamxform.Prelude) (*streamxform.Transformer, string)
+	Replan func(pre streamxform.Prelude) (streamxform.Xform, string)
 	// Fallback is the plugin's buffered path, called once the whole body is collected. If the buffered handler calls
 	// ReplaceHttpRequestBody itself, the driver reads that content back and returns it. ActionPause means the handler answered locally or waits for an async result.
 	Fallback func(body []byte) types.Action

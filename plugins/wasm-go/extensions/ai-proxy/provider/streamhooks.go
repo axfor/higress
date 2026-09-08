@@ -52,7 +52,7 @@ type StreamPlan struct {
 	// Replan picks the real transformer once model is known, for providers whose wire format depends on the mapped
 	// model (Vertex: a claude-prefixed model takes the Anthropic format, anything else the Gemini one). Tr is then only
 	// a probe for model. See guard.Plan.Replan.
-	Replan func(pre streamxform.Prelude) (*streamxform.Transformer, string)
+	Replan func(pre streamxform.Prelude) (streamxform.Xform, string)
 }
 
 // streamDefaultProviders are the providers that go through defaultTransformRequestBody
@@ -73,7 +73,78 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	if plan == nil {
 		return nil, why
 	}
-	return c.withFirstByteTimeout(plan, apiName)
+	plan, why = c.withFirstByteTimeout(plan, apiName)
+	if plan == nil {
+		return nil, why
+	}
+	return c.withCustomSettings(plan)
+}
+
+// withCustomSettings reproduces main.go's ReplaceByCustomSettings, which rewrites the body before any handler
+// sees it: the settings stage goes in front of whatever the plan transforms with, as the first stage of a
+// pipeline, and stands alone where the buffered path would otherwise forward the body untouched. A replanned
+// transformer gets its own fresh stage, since the replay starts from the first byte. Settings whose path uses
+// gjson syntax beyond plain dotted keys keep the buffered path.
+func (c *ProviderConfig) withCustomSettings(p *StreamPlan) (*StreamPlan, string) {
+	if len(c.customSettings) == 0 {
+		return p, ""
+	}
+	settings, why := c.streamSettings()
+	if why != "" {
+		return nil, why
+	}
+	if p.Passthrough {
+		p.Passthrough = false
+		p.Tr = streamxform.NewSettings(settings)
+		return p, ""
+	}
+	if p.Tr != nil {
+		p.Tr = streamxform.NewPipeline(streamxform.NewSettings(settings), p.Tr)
+	}
+	if p.Replan != nil {
+		inner := p.Replan
+		p.Replan = func(pre streamxform.Prelude) (streamxform.Xform, string) {
+			tr, why := inner(pre)
+			if tr == nil {
+				return nil, why
+			}
+			return streamxform.NewPipeline(streamxform.NewSettings(settings), tr), ""
+		}
+	}
+	return p, ""
+}
+
+// streamSettings converts the configured customSettings (names already adjusted to the protocol) into the
+// stage's form. sjson path syntax other than dotted keys -- escapes, wildcards, array indexes, modifiers --
+// is declared unsupported rather than reproduced.
+func (c *ProviderConfig) streamSettings() ([]streamxform.Setting, string) {
+	out := make([]streamxform.Setting, 0, len(c.customSettings))
+	for _, s := range c.customSettings {
+		if strings.ContainsAny(s.name, `\*?#|@!`) {
+			return nil, "customSettings path uses gjson syntax the streaming stage does not reproduce"
+		}
+		parts := strings.Split(s.name, ".")
+		for _, part := range parts {
+			if part == "" || isArrayIndex(part) {
+				return nil, "customSettings path with an array index or an empty component keeps the buffered path"
+			}
+		}
+		out = append(out, streamxform.Setting{Path: parts, Value: []byte(s.value), Overwrite: s.overwrite})
+	}
+	return out, ""
+}
+
+// isArrayIndex reports whether a path component means an array position to sjson: digits, or -1 for append.
+func isArrayIndex(part string) bool {
+	if part == "-1" {
+		return true
+	}
+	for _, r := range part {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // withFirstByteTimeout reproduces handleRequestBody's first-byte timeout header: set when the request streams
@@ -119,9 +190,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	if c.typ == providerTypeGeneric {
 		// generic's OnRequestBody writes the body back unchanged without handleRequestBody:
 		// only the two settings in main.go that apply to every provider touch the body / context
-		if len(c.customSettings) > 0 {
-			return nil, "customSettings rewrites the body"
-		}
 		if c.IsRetryOnFailureEnabled() {
 			return nil, "retryOnFailure needs the whole body stored in the context"
 		}
@@ -144,9 +212,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			return nil, "apiName not supported"
 		}
 		return &StreamPlan{Passthrough: true}, ""
-	}
-	if len(c.customSettings) > 0 {
-		return nil, "customSettings rewrites the body"
 	}
 	if c.context != nil {
 		return nil, "context injection needs the whole body"
@@ -585,7 +650,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			RequireModelBeforeCommit:  true,
 			RequireStreamBeforeCommit: true,
 		}
-		p.Replan = func(pre streamxform.Prelude) (*streamxform.Transformer, string) {
+		p.Replan = func(pre streamxform.Prelude) (streamxform.Xform, string) {
 			mapped, err := mapStrict(pre.Model)
 			if err != nil {
 				return nil, err.Error()

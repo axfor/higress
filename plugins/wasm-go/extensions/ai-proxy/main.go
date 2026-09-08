@@ -681,9 +681,9 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		plan.Tr.SetCommitBytes(streamCommitWindowBytes) // before the first Write, which happens in Feed
 	}
 	x.plan = plan
-	var replan func(streamxform.Prelude) (*streamxform.Transformer, string)
+	var replan func(streamxform.Prelude) (streamxform.Xform, string)
 	if plan.Replan != nil {
-		replan = func(pre streamxform.Prelude) (*streamxform.Transformer, string) {
+		replan = func(pre streamxform.Prelude) (streamxform.Xform, string) {
 			tr, why := plan.Replan(pre)
 			if tr != nil && streamCommitWindowBytes > 0 {
 				tr.SetCommitBytes(streamCommitWindowBytes)
