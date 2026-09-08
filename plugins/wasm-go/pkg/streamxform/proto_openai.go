@@ -59,7 +59,13 @@ type OpenAIState struct {
 	Model         string // original model (valid when ModelSeen)
 	Mapped        string // mapped model (valid when ModelSeen)
 	ReasoningSeen bool   // some message has a non-empty reasoning_content (gjson String() != "")
+	// ClaudeThinking, when the request came through the Claude protocol conversion, reports the thinking type and
+	// budget handleRequestBody keeps from the Claude body for the variants that read them; nil otherwise.
+	ClaudeThinking func() (typ string, budget int)
 }
+
+// SetClaudeThinking wires the Claude conversion's accessor into the state the Variant reads at the end.
+func (p *openaiProto) SetClaudeThinking(f func() (string, int)) { p.st.ClaudeThinking = f }
 
 type openaiProto struct {
 	opt OpenAIOptions

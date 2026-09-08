@@ -94,9 +94,16 @@ func (v *ZhipuVariant) Tail(t *Transformer, st *OpenAIState) {
 	}
 	if v.effortSeen && gjsonStringNonEmpty(v.effortRaw) {
 		thinking = lit10 // sjson replaces it with a map as a whole
-	} else if v.effortSeen {
-		w.Key("reasoning_effort")
-		w.Raw(v.effortRaw)
+	} else {
+		if v.effortSeen {
+			w.Key("reasoning_effort")
+			w.Raw(v.effortRaw)
+		}
+		if st.ClaudeThinking != nil { // a Claude request without thinking enabled: pinned to disabled
+			if typ, _ := st.ClaudeThinking(); typ != "enabled" {
+				thinking = []byte(`{"type":"disabled"}`)
+			}
+		}
 	}
 	if st.ReasoningSeen {
 		var err error
@@ -165,6 +172,27 @@ func (v *OpenRouterVariant) Tail(t *Transformer, st *OpenAIState) {
 		n = gjsonInt(v.rmtRaw)
 	}
 	if !v.rmtSeen || n == 0 {
+		if st.ClaudeThinking != nil {
+			// a Claude request with thinking enabled and a budget: reasoning_effort dropped, the budget becomes reasoning.max_tokens
+			if typ, budget := st.ClaudeThinking(); typ == "enabled" && budget > 0 {
+				if v.rmtSeen {
+					w.Key("reasoning_max_tokens")
+					w.Raw(v.rmtRaw)
+				}
+				var reasoning []byte
+				if v.reasonSeen {
+					reasoning = v.reasonRaw
+				}
+				reasoning, err := setObjectKey(reasoning, "max_tokens", []byte(strconv.Itoa(budget)))
+				if err != nil {
+					t.Bail("reasoning is not an object, sjson's handling not reproduced")
+					return
+				}
+				w.Key("reasoning")
+				w.Raw(reasoning)
+				return
+			}
+		}
 		if v.effortSeen {
 			w.Key("reasoning_effort")
 			w.Raw(v.effortRaw)

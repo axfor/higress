@@ -40,7 +40,7 @@ description: AI 代理插件配置参考
 - `azure`（请求路径依赖 body 里的 model 时，model 须出现在请求体前 64KB 内，否则回落）；
 - 目标为 Gemini 的文生文请求（OpenAI → Gemini 协议转换；请求路径依赖 model 与 stream，二者须出现在前 64KB 内；含 http(s) 图片链接的请求需要抓取图片，仍走全量路径）；
 - `generic`（请求体逐块直接放行）；Claude 原生接口（`/v1/messages`、`/v1/complete`、embeddings）以及上述透传供应商的其他 JSON 接口（images / audio / responses / videos / fine-tuning 等）。multipart 请求仍走全量路径；
-- Claude 协议入站的自动转换（`/v1/messages` 打到不原生支持 Anthropic 协议的 OpenAI 兼容供应商）：引擎里两个转换器串联，先 Claude → OpenAI（每条消息整条有界持有后按官方规则转换，system 在 messages 之后时整个 messages 有界持有），再走该供应商的透传转换；有自己转换逻辑的供应商（zhipuai、openrouter、qwen、minimax、azure 等）仍走全量路径；
+- Claude 协议入站的自动转换（`/v1/messages` 打到不原生支持 Anthropic 协议的 OpenAI 兼容供应商）：引擎里两个转换器串联，先 Claude → OpenAI（每条消息整条有界持有后按官方规则转换，system 在 messages 之后时整个 messages 有界持有），再走该供应商自己的转换——就是该供应商的 chat 计划前面套一段转换（zhipuai、openrouter、azure、minimax、gemini、vertex 等都可以，`mergeConsecutiveMessages` 打开时合并段放在两者之间）；zhipuai / openrouter 要读全量路径从 Claude body 里取的 thinking 类型与预算，转换段把它们交给变体在尾部用；
 - Gemini 原生 `generateContent` / `streamGenerateContent`（全量路径本就不改 body，逐块放行）；
 - embeddings：`gemini`（`input` 数组逐元素变 `requests`，元素要带模型名，`input` 在 `model` 之前时整个 `input` 有界持有）、`vertex`、`qwen` 原生（非字符串元素与全量路径同样拒绝）；`gemini` 的 `/v1/images/generations`；`vertex` 的 `/v1/images/generations` / `edits` / `variations`（JSON 请求体；图片输入的 data URL 边到边出成 `inlineData`，http(s) 链接须在 8KB 内，prompt 最后写出；`images` 与 `image` 同时给且 `image` 在前时 parts 顺序按到达顺序，一个输入同时给非空的 `url` 与 `image_url` 时拒绝而不是取后者；multipart 请求体仍走全量路径）；
 - `protocol: original` 的所有供应商（全量路径在 original 下不碰 body），例外是对 body 签名的 hunyuan 与 AK/SK 模式的 bedrock，以及在 original 下同样重建 body 的 Pro 接口模式 minimax；

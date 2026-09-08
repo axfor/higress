@@ -665,3 +665,35 @@ func (p *c2oProto) Tail(t *Transformer) {
 		}
 	}
 }
+
+// ClaudeThinking reports what handleRequestBody stores from the Claude body for the providers whose own
+// transform reads it (zhipuai, openrouter): the thinking type, "disabled" when the field is absent, and the
+// budget when thinking is enabled and the budget positive. Valid once the body has been read.
+func (p *c2oProto) ClaudeThinking() (typ string, budget int) {
+	typ = "disabled"
+	if p.thinkRaw == nil {
+		return typ, 0
+	}
+	var th struct {
+		Type         string `json:"type"`
+		BudgetTokens int    `json:"budget_tokens"`
+	}
+	if err := json.Unmarshal(p.thinkRaw, &th); err != nil {
+		return typ, 0
+	}
+	if th.Type != "" {
+		typ = th.Type
+	}
+	if typ == "enabled" && th.BudgetTokens > 0 {
+		budget = th.BudgetTokens
+	}
+	return typ, budget
+}
+
+// ClaudeThinkingOf returns the accessor of a Claude-to-OpenAI stage, nil for any other transformer.
+func ClaudeThinkingOf(tr *Transformer) func() (string, int) {
+	if p, ok := tr.Protocol().(*c2oProto); ok {
+		return p.ClaudeThinking
+	}
+	return nil
+}

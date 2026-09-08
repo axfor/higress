@@ -83,6 +83,12 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	if plan == nil {
 		return nil, why
 	}
+	if need, _ := ctx.GetContext("needClaudeResponseConversion").(bool); need {
+		plan, why = c.withClaudeInput(plan, apiName)
+		if plan == nil {
+			return nil, why
+		}
+	}
 	plan = c.withMerge(plan, apiName)
 	plan, why = c.withFirstByteTimeout(plan, apiName)
 	if plan == nil {
@@ -313,9 +319,6 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	}
 	if c.IsRetryOnFailureEnabled() {
 		return nil, "retryOnFailure needs the whole body stored in the context"
-	}
-	if need, _ := ctx.GetContext("needClaudeResponseConversion").(bool); need {
-		return c.claudeInputPlan(ctx, apiName, prov)
 	}
 	if !c.isSupportedAPI(apiName) {
 		return nil, "apiName not supported"
@@ -1001,40 +1004,51 @@ func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName 
 	}
 }
 
-// claudeInputPlan streams the automatic Claude → OpenAI protocol conversion: handleRequestBody converts the body
-// with ConvertClaudeRequestToOpenAIWithOptions, strips the Claude-internal fields again for every provider but
-// bedrock and claude, and hands the result to the provider's own transform. That is two transforms in series, a
-// Pipeline: the conversion first, the provider's default OpenAI transformer second. Only the OpenAI-compatible
-// family that goes through defaultTransformRequestBody is covered; the providers whose variants read the
-// thinking context keys the buffered path sets from the Claude body keep the buffered path.
-func (c *ProviderConfig) claudeInputPlan(ctx wrapper.HttpContext, apiName ApiName, prov Provider) (*StreamPlan, string) {
+// withClaudeInput streams the automatic Claude → OpenAI protocol conversion: handleRequestBody converts the body
+// of a /v1/messages request for a provider without native Anthropic support, merges consecutive messages when
+// configured, and hands the result to the provider's own transform. That is the provider's chat plan with the
+// conversion in front, a Pipeline; the merge stage goes between them. The variants that read what the buffered
+// path keeps from the Claude body (zhipuai, openrouter: the thinking type and budget) get it from the conversion
+// stage. Under the original protocol the buffered path converts nothing, and a passthrough plan stays one.
+func (c *ProviderConfig) withClaudeInput(p *StreamPlan, apiName ApiName) (*StreamPlan, string) {
 	if apiName != ApiNameChatCompletion {
 		return nil, "automatic conversion of Claude protocol input on an endpoint other than chat"
 	}
-	if !(c.typ == providerTypeOpenAI || c.typ == providerTypeLongcat || c.typ == providerTypeDoubao || streamDefaultProviders[c.typ]) {
-		return nil, "automatic conversion of Claude protocol input for a provider with its own conversion"
+	if p.Passthrough || p.Tr == nil {
+		return p, ""
 	}
-	first := streamxform.NewClaudeToOpenAI(streamxform.ClaudeToOpenAIOptions{
-		PreserveReasoning:       c.supportsMessageReasoningContent(),
-		DisableStreamUsageStats: c.disableStreamUsageStats,
-	})
-	if ChatRequestTypeCheck {
-		first.SetFieldTree(claudeRequestFieldTree)
+	wrap := func(tr streamxform.Xform) streamxform.Xform {
+		first := streamxform.NewClaudeToOpenAI(streamxform.ClaudeToOpenAIOptions{
+			PreserveReasoning:       c.supportsMessageReasoningContent(),
+			DisableStreamUsageStats: c.disableStreamUsageStats,
+		})
+		if ChatRequestTypeCheck {
+			first.SetFieldTree(claudeRequestFieldTree)
+		}
+		if inner, ok := tr.(*streamxform.Transformer); ok {
+			if s, ok := inner.Protocol().(interface{ SetClaudeThinking(func() (string, int)) }); ok {
+				s.SetClaudeThinking(streamxform.ClaudeThinkingOf(first))
+			}
+		}
+		tail := tr
+		if c.mergeConsecutiveMessages { // handleRequestBody merges after the conversion and before the provider's transform
+			tail = streamxform.NewPipeline(streamxform.NewMergeConsecutive(), tr)
+		}
+		return streamxform.NewPipeline(first, tail)
 	}
-	second := streamxform.NewOpenAI(streamxform.OpenAIOptions{
-		MapModel:               func(m string) string { return getMappedModel(m, c.modelMapping) },
-		DetectStream:           true,
-		NormalizeUsage:         c.IsOpenAIProtocol() && !c.disableStreamUsageStats,
-		DeveloperRoleSupported: isDeveloperRoleSupported(c.typ),
-		CheckMessages:          true,
-		ResponseFormat:         c.streamResponseFormat(),
-		InsertSystem:           c.streamContextContent(),
-	})
-	var tail streamxform.Xform = second
-	if c.mergeConsecutiveMessages { // handleRequestBody merges after the conversion and before the provider's transform
-		tail = streamxform.NewPipeline(streamxform.NewMergeConsecutive(), second)
+	p.Tr = wrap(p.Tr)
+	if p.Replan != nil {
+		inner := p.Replan
+		p.Replan = func(pre streamxform.Prelude) (streamxform.Xform, string) {
+			tr, why := inner(pre)
+			if tr == nil {
+				return nil, why
+			}
+			return wrap(tr), ""
+		}
 	}
-	return &StreamPlan{Tr: streamxform.NewPipeline(first, tail), ApplyStream: true, ApplyModel: true, ContextHandled: true, MergeHandled: true}, ""
+	p.MergeHandled = true
+	return p, ""
 }
 
 // streamResponseFormat is the configured responseJsonSchema as the openai / longcat TransformRequestBody sets it

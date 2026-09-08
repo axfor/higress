@@ -1157,3 +1157,67 @@ func TestStreamingRequest_MultipartImageEdit(t *testing.T) {
 		}
 	})
 }
+
+// Claude protocol input in front of providers with a conversion of their own: the provider's chat plan with the
+// Claude-to-OpenAI stage ahead. zhipuai and openrouter read the thinking config the buffered path keeps from the
+// Claude body; gemini and minimax take the OpenAI shape the stage produces.
+func TestStreamingRequest_ClaudeInputVariants(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		big := strings.Repeat("z", 100000)
+		for _, c := range []struct {
+			name, cfg, body string
+			check           func(out map[string]any)
+			path            string
+		}{
+			{"zhipuai thinking absent", `{"provider":{"type":"zhipuai","apiTokens":["t"],"modelMapping":{"claude-3":"glm-4"}}}`,
+				`{"model":"claude-3","system":"S","max_tokens":10,"messages":[{"role":"user","content":"` + big + `"}]}`,
+				func(out map[string]any) {
+					require.Equal(t, map[string]any{"type": "disabled"}, out["thinking"])
+					require.Equal(t, "glm-4", out["model"])
+					require.Len(t, out["messages"].([]any), 2)
+				}, "/api/paas/v4/chat/completions"},
+			{"zhipuai thinking enabled", `{"provider":{"type":"zhipuai","apiTokens":["t"],"modelMapping":{"claude-3":"glm-4"}}}`,
+				`{"model":"claude-3","system":"S","max_tokens":10,"thinking":{"type":"enabled","budget_tokens":2048},"messages":[{"role":"user","content":"` + big + `"}]}`,
+				func(out map[string]any) {
+					require.Equal(t, map[string]any{"type": "enabled"}, out["thinking"], "reasoning_effort from the conversion becomes thinking")
+					_, hasEffort := out["reasoning_effort"]
+					require.False(t, hasEffort)
+				}, "/api/paas/v4/chat/completions"},
+			{"openrouter budget", `{"provider":{"type":"openrouter","apiTokens":["t"],"modelMapping":{"claude-3":"anthropic/claude-3"}}}`,
+				`{"model":"claude-3","system":"S","max_tokens":10,"thinking":{"type":"enabled","budget_tokens":3000},"messages":[{"role":"user","content":"` + big + `"}]}`,
+				func(out map[string]any) {
+					require.Equal(t, map[string]any{"max_tokens": float64(3000)}, out["reasoning"])
+					_, hasEffort := out["reasoning_effort"]
+					require.False(t, hasEffort)
+					require.Equal(t, "anthropic/claude-3", out["model"])
+				}, "/api/v1/chat/completions"},
+			{"gemini", `{"provider":{"type":"gemini","apiTokens":["g-key"],"modelMapping":{"claude-3":"gemini-2.0-flash"}}}`,
+				`{"model":"claude-3","system":"S","max_tokens":10,"messages":[{"role":"user","content":"` + big + `"}]}`,
+				func(out map[string]any) {
+					require.Equal(t, "S", out["system_instruction"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"])
+					require.Len(t, out["contents"].([]any), 1)
+				}, "/v1beta/models/gemini-2.0-flash:generateContent"},
+			{"minimax v2", `{"provider":{"type":"minimax","apiTokens":["t"],"modelMapping":{"claude-3":"MiniMax-Text-01"}}}`,
+				`{"model":"claude-3","system":"S","max_tokens":10,"messages":[{"role":"user","content":"` + big + `"}]}`,
+				func(out map[string]any) {
+					msgs := out["messages"].([]any)
+					require.Len(t, msgs, 2)
+					require.Equal(t, "system", msgs[0].(map[string]any)["role"])
+					require.Equal(t, "MiniMax-Text-01", out["model"])
+				}, "/v1/text/chatcompletion_v2"},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(json.RawMessage(c.cfg))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status, c.name)
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/messages"))
+				actions, upstream := feedChunks(host, []byte(c.body), 4096)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+				var out map[string]any
+				require.NoError(t, json.Unmarshal(upstream, &out), "%s: %s", c.name, truncate(upstream))
+				c.check(out)
+				require.Equal(t, c.path, requestHeader(host, ":path"), c.name)
+			}()
+		}
+	})
+}
