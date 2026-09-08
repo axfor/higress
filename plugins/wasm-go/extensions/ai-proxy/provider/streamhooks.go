@@ -395,7 +395,9 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 	case c.typ == providerTypeQwen && !c.qwenEnableCompatible:
 		// native DashScope protocol: the buffered onChatCompletionRequestBody changes the path and headers by model / stream in the body phase
 		if !isChat {
-			return nil, "native qwen protocol streams chat completion only"
+			// every other endpoint of the native protocol (the Anthropic messages passthrough, files, batches, rerank ...)
+			// goes through defaultTransformRequestBody: model mapping only, the path is header-phase work
+			return defaultPlan(nil), ""
 		}
 		mapStrict := func(m string) (string, error) {
 			if m == "" {

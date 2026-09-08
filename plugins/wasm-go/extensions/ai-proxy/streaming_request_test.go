@@ -1221,3 +1221,22 @@ func TestStreamingRequest_ClaudeInputVariants(t *testing.T) {
 		}
 	})
 }
+
+// Native Qwen's Anthropic endpoint: /v1/messages is passed through with the model mapped, as the default transform does.
+func TestStreamingRequest_QwenNativeAnthropicPassthrough(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(json.RawMessage(`{"provider":{"type":"qwen","apiTokens":["q"],"qwenEnableCompatible":false,"modelMapping":{"m":"qwen3-max"}}}`))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/messages"))
+		body := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"` + strings.Repeat("a", 100000) + `"}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-2], "released past the window")
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out), truncate(upstream))
+		require.Equal(t, "qwen3-max", out["model"])
+		require.Len(t, out["messages"].([]any), 1)
+		require.Contains(t, requestHeader(host, ":path"), "/apps/anthropic")
+	})
+}
