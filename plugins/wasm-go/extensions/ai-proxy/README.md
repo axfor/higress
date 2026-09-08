@@ -48,10 +48,13 @@ description: AI 代理插件配置参考
 - vertex OpenAI 兼容模式（`vertexOpenAICompatible`）的 chat（只做模型映射与固定路径；token 缓存要求同上）；
 - `cohere` 的 chat（OpenAI → Cohere v1 chat：只取第一条消息的文本与几个标量，其余字段与消息全部丢弃，与全量路径相同）；
 - `deepl`（OpenAI → DeepL 翻译：非 system 消息的文本进 `text` 数组、system 消息进 `context`，host 由 `model` 是 Free / Pro 决定）；
+- `minimax` Pro 接口模式的 chat（system → `bot_setting`、user / assistant → 带 sender 的消息、其余角色丢弃，GroupId 进路径）；
+- `dify` 的 chat（各消息文本按角色标题拼成一个字符串，边收边写进 `query` 或 `inputs`；`conversation_id` 取自请求头）；
+- `triton` 的 chat（只留最后一条消息的 id 与文本，路径与 host 由模型、stream 决定）；
 - `kling` 的 `/v1/videos`（body 原样，`model` 映射进 `model_name`；路径由是否带图片输入字段决定，body 超过窗口且尚未见到图片字段时回落）；
 - vertex 的 chat（OpenAI → Anthropic 格式或 Vertex 自己的 Gemini 格式，按映射后的模型选择）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内。Gemini 格式下 assistant 消息的内容要等 `tool_calls` 到齐（超过 1MB 回落），含 http(s) 图片链接的 URL 须在 8KB 内。
 
-其余供应商（Vertex 的 embeddings / 生图、Bedrock Converse、Hunyuan、MiniMax Pro、Dify、Triton）以及配置了
+其余供应商（Vertex 的 embeddings / 生图、Bedrock Converse、Hunyuan）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
 `firstByteTimeout` / `responseJsonSchema` / `providerBasePath`（qwen、minimax）/ `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 

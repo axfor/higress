@@ -2,6 +2,7 @@ package provider
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -233,6 +234,47 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		opts.ModelOnlyIfPresent = true
 		opts.DetectStream = false // the compatible branch does not call defaultTransformRequestBody: no Accept / isStreaming
 		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}, ""
+
+	case c.typ == providerTypeMinimax && c.minimaxApiType == minimaxApiTypePro && isChat:
+		// handleRequestBodyByChatCompletionPro: the request is rebuilt (system → bot_setting, user / assistant →
+		// sender messages, other roles dropped), model mapped leniently, the path gets the GroupId in the body
+		// phase. Neither Accept nor the model context keys are written there.
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewMiniMaxPro(streamxform.MiniMaxProOptions{
+			MapModel: mapLenient, DefaultBotName: defaultBotName, DefaultSenderName: defaultSenderName,
+			DefaultBotSettingContent: defaultBotSettingContent, SenderTypeBot: senderTypeBot, SenderTypeUser: senderTypeUser,
+		})})
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			if err := util.OverwriteRequestPath(fmt.Sprintf("%s?GroupId=%s", minimaxChatCompletionProPath, c.minimaxGroupId)); err != nil {
+				log.Errorf("minimaxProvider: overwrite request path failed: %v", err)
+			}
+		}
+		return p, ""
+
+	case c.typ == providerTypeDify && isChat:
+		// difyChatGenRequest: every message's text under a role heading, into query or inputs by bot type;
+		// parseRequestAndMapModel's Accept is overwritten by the header snapshot, isStreaming and the model keys stay.
+		conv, _ := proxywasm.GetHttpRequestHeader("ConversationId")
+		return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewDify(streamxform.DifyOptions{
+			MapModel: c.mapStrict(), BotType: c.botType, InputVariable: c.inputVariable, ConversationId: conv,
+		}), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true}), ""
+
+	case c.typ == providerTypeTriton && isChat:
+		// BuildTritonTexGenRequest keeps the last message's id and text; path and host are set from model and stream
+		// in the body phase.
+		tp, ok := prov.(*tritonProvider)
+		if !ok {
+			return nil, "unexpected triton provider instance type"
+		}
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewTriton(streamxform.TritonOptions{MapModel: c.mapStrict()}),
+			ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true, RequireStreamBeforeCommit: true})
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			if err := util.OverwriteRequestPath(c.bodyPhasePath(tp.getFinalRequestPath(ctx, &chatCompletionRequest{Model: model}, pre.Stream))); err != nil {
+				log.Errorf("tritonProvider: overwrite request path failed: %v", err)
+			}
+			_ = proxywasm.ReplaceHttpRequestHeader(util.HeaderAuthority, c.tritonDomain)
+		}
+		return p, ""
 
 	case c.typ == providerTypeMinimax:
 		// V2 endpoint (default): the buffered handleRequestBodyByChatCompletionV2 only changes model and pins the path to chatcompletion_v2;

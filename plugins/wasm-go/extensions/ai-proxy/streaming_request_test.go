@@ -449,3 +449,86 @@ func TestStreamingRequest_KlingVideos(t *testing.T) {
 		}
 	})
 }
+
+var streamingMiniMaxProConfig = json.RawMessage(`{"provider":{"type":"minimax","apiTokens":["mk"],"minimaxApiType":"pro","minimaxGroupId":"g1","modelMapping":{"m":"abab6.5s-chat"}}}`)
+var streamingDifyConfig = json.RawMessage(`{"provider":{"type":"dify","apiTokens":["dk"],"botType":"Chat"}}`)
+var streamingTritonConfig = json.RawMessage(`{"provider":{"type":"triton","apiTokens":["tk"],"tritonDomain":"triton.local","tritonModelVersion":"2","modelMapping":{"m":"llama"}}}`)
+
+// MiniMax Pro: system becomes bot_setting, user / assistant become sender messages, the GroupId goes into the path.
+func TestStreamingRequest_MiniMaxPro(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingMiniMaxProConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		text := strings.Repeat("m", 100000)
+		body := `{"model":"m","messages":[{"role":"system","name":"Bot","content":"S"},{"role":"user","content":"` + text + `"}],"stream":true,"max_tokens":7}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, "abab6.5s-chat", out["model"])
+		require.Equal(t, true, out["stream"])
+		require.Equal(t, float64(7), out["tokens_to_generate"])
+		require.Equal(t, true, out["mask_sensitive_info"])
+		msgs := out["messages"].([]any)
+		require.Len(t, msgs, 1)
+		require.Equal(t, "USER", msgs[0].(map[string]any)["sender_type"])
+		require.Equal(t, text, msgs[0].(map[string]any)["text"])
+		bots := out["bot_setting"].([]any)
+		require.Equal(t, "Bot", bots[0].(map[string]any)["bot_name"])
+		require.Equal(t, "Bot", out["reply_constraints"].(map[string]any)["sender_name"])
+		require.Equal(t, "/v1/text/chatcompletion_pro?GroupId=g1", requestHeader(host, ":path"))
+	})
+}
+
+// Dify: the conversation becomes one query string, written across the messages; the rest follows in Tail.
+func TestStreamingRequest_Dify(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingDifyConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		hdrs := append(streamingRequestHeaders("/v1/chat/completions"), [2]string{"ConversationId", "conv-9"})
+		host.CallOnHttpRequestHeaders(hdrs)
+
+		text := strings.Repeat("d", 100000)
+		body := `{"model":"m","stream":true,"messages":[{"role":"system","content":"S"},{"role":"user","content":"` + text + `"}],"user":"bob"}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, "SYSTEM: \nS\nUSER: \n"+text+"\n", out["query"])
+		require.Equal(t, map[string]any{}, out["inputs"])
+		require.Equal(t, "streaming", out["response_mode"])
+		require.Equal(t, "bob", out["user"])
+		require.Equal(t, "conv-9", out["conversation_id"])
+		require.Equal(t, false, out["auto_generate_name"])
+		require.Equal(t, "api.dify.ai", requestHeader(host, ":authority"))
+	})
+}
+
+// Triton: id and text_input come from the last message; path and host are set from model and stream.
+func TestStreamingRequest_Triton(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingTritonConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		text := strings.Repeat("t", 100000)
+		body := `{"model":"m","stream":true,"messages":[{"id":"a","role":"user","content":"` + text + `"},{"id":"b","role":"user","content":"last"}],"temperature":0.5}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, "b", out["id"])
+		require.Equal(t, "last", out["text_input"])
+		require.Equal(t, map[string]any{"stream": true, "temperature": 0.5}, out["parameters"])
+		require.Equal(t, "/v2/models/llama/versions/2/generate_stream", requestHeader(host, ":path"))
+		require.Equal(t, "triton.local", requestHeader(host, ":authority"))
+	})
+}
