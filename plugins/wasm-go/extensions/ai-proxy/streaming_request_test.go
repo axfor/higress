@@ -625,3 +625,70 @@ func TestStreamingRequest_GeminiImageGeneration(t *testing.T) {
 		require.Equal(t, "/v1beta/models/text-embedding-004:predict", requestHeader(host, ":path"))
 	})
 }
+
+var streamingClaudeFbtConfig = json.RawMessage(`{"provider":{"type":"claude","apiTokens":["sk-test"],"modelMapping":{"m":"claude-3"},"firstByteTimeout":3000}}`)
+var streamingQwenNativeBasePathConfig = json.RawMessage(`{"provider":{"type":"qwen","apiTokens":["q"],"qwenEnableCompatible":false,"providerBasePath":"/pre","modelMapping":{"m":"qwen-vl-plus"}}}`)
+var streamingQwenCompatBasePathConfig = json.RawMessage(`{"provider":{"type":"qwen","apiTokens":["q"],"providerBasePath":"/pre"}}`)
+
+// firstByteTimeout: the header is set at the commit point from stream; stream past the window means the buffered path.
+func TestStreamingRequest_FirstByteTimeout(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		const hdr = "x-envoy-upstream-rq-first-byte-timeout-ms"
+		big := strings.Repeat("f", 100000)
+		for _, c := range []struct {
+			name, body, want string
+			buffered         bool
+		}{
+			{"stream first", `{"model":"m","stream":true,"messages":[{"role":"user","content":"` + big + `"}]}`, "3000", false},
+			{"not streaming", `{"model":"m","stream":false,"messages":[{"role":"user","content":"` + big + `"}]}`, "", false},
+			{"stream past the window", `{"model":"m","messages":[{"role":"user","content":"` + big + `"}],"stream":true}`, "3000", true},
+		} {
+			host, status := wasmtest.NewTestHost(streamingClaudeFbtConfig)
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+			actions, upstream := feedChunks(host, []byte(c.body), 4096)
+			require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.name)
+			if c.buffered {
+				for i, a := range actions[:len(actions)-1] {
+					require.Equal(t, types.ActionPause, a, "%s chunk %d: held for the buffered path", c.name, i)
+				}
+			} else {
+				require.Equal(t, types.ActionContinue, actions[len(actions)/2+8], "%s: released past the window", c.name)
+			}
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(upstream, &out), c.name)
+			require.Equal(t, "claude-3", out["model"], c.name)
+			require.Equal(t, c.want, requestHeader(host, hdr), c.name)
+			host.Reset()
+		}
+	})
+}
+
+// providerBasePath: applied again to a path set in the body phase (native qwen's multimodal endpoint), and streaming stays on.
+func TestStreamingRequest_ProviderBasePath(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		big := strings.Repeat("p", 100000)
+		// stream before the large message: native qwen's headers depend on it, so it has to be known at the commit point
+		body := `{"model":"m","stream":false,"messages":[{"role":"user","content":"` + big + `"}]}`
+		for _, c := range []struct {
+			cfg  json.RawMessage
+			path string
+		}{
+			{streamingQwenNativeBasePathConfig, "/pre/api/v1/services/aigc/multimodal-generation/generation"},
+			{streamingQwenCompatBasePathConfig, "/pre/compatible-mode/v1/chat/completions"},
+		} {
+			func() {
+				host, status := wasmtest.NewTestHost(c.cfg)
+				defer host.Reset() // a failed assertion must not leave the host locked for the wasm mode
+				require.Equal(t, types.OnPluginStartStatusOK, status)
+				host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+				actions, upstream := feedChunks(host, []byte(body), 4096)
+				require.Equal(t, types.ActionPause, actions[0], c.path)
+				require.Equal(t, types.ActionContinue, actions[len(actions)/2+8], "%s: released past the window: streamed, not buffered", c.path)
+				require.Equal(t, types.ActionContinue, actions[len(actions)-1], c.path)
+				require.NotEmpty(t, upstream, c.path)
+				require.Equal(t, c.path, requestHeader(host, ":path"))
+			}()
+		}
+	})
+}

@@ -58,7 +58,8 @@ description: AI 代理插件配置参考
 
 其余供应商（Vertex 的生图与图片编辑、AK/SK 模式的 Bedrock、Hunyuan）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
-`firstByteTimeout` / `responseJsonSchema` / `providerBasePath`（qwen、minimax）/ `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
+`responseJsonSchema` / `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
+`firstByteTimeout` 在 chat 上照常生效（`stream` 须出现在窗口内，否则回落），`providerBasePath` 对所有供应商照常生效。
 
 运行指标：`ai_proxy.stream_xform.streamed` / `fallback` / `uncoverable` / `skipped` 四个计数器（Envoy 统计里带 `wasmcustom.` 前缀）（走流式 / 回落到全量 /
 提交点后失败 / 配置或供应商不适用）。回落率应接近零，否则内存容量仍要按全量缓冲配置。

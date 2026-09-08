@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
@@ -68,6 +69,53 @@ var streamDefaultProviders = map[string]bool{
 
 // NewStreamPlan picks the streaming protocol for one request. A nil plan comes with why; the caller takes the buffered path.
 func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName, prov Provider) (plan *StreamPlan, why string) {
+	plan, why = c.newStreamPlan(ctx, apiName, prov)
+	if plan == nil {
+		return nil, why
+	}
+	return c.withFirstByteTimeout(plan, apiName)
+}
+
+// withFirstByteTimeout reproduces handleRequestBody's first-byte timeout header: set when the request streams
+// (isStreamingAPI reads stream from the body). For chat the plan already observes stream, so the header is set
+// at the commit point and stream has to be known by then; the native Gemini streaming endpoint always streams;
+// the other endpoint kinds that read stream keep the buffered path when the setting is on.
+func (c *ProviderConfig) withFirstByteTimeout(p *StreamPlan, apiName ApiName) (*StreamPlan, string) {
+	if c.firstByteTimeout == 0 {
+		return p, ""
+	}
+	set := func() {
+		_ = proxywasm.ReplaceHttpRequestHeader("x-envoy-upstream-rq-first-byte-timeout-ms", strconv.FormatUint(uint64(c.firstByteTimeout), 10))
+	}
+	prev := p.AfterPrelude
+	switch {
+	case apiName == ApiNameGeminiStreamGenerateContent:
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			if prev != nil {
+				prev(ctx, pre)
+			}
+			set()
+		}
+		return p, ""
+	case apiName == ApiNameChatCompletion && p.Tr != nil && !p.Passthrough:
+		p.RequireStreamBeforeCommit = true
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			if prev != nil {
+				prev(ctx, pre)
+			}
+			if pre.Stream {
+				set()
+			}
+		}
+		return p, ""
+	case c.isStreamingAPI(apiName, nil) || apiName == ApiNameCompletion || apiName == ApiNameImageGeneration || apiName == ApiNameImageEdit ||
+		apiName == ApiNameResponses || apiName == ApiNameQwenAsyncAIGC || apiName == ApiNameAnthropicMessages || apiName == ApiNameAnthropicComplete:
+		return nil, "firstByteTimeout reads stream on an endpoint whose plan does not observe it"
+	}
+	return p, "" // endpoints that never stream: the header is never set
+}
+
+func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName, prov Provider) (plan *StreamPlan, why string) {
 	if c.typ == providerTypeGeneric {
 		// generic's OnRequestBody writes the body back unchanged without handleRequestBody:
 		// only the two settings in main.go that apply to every provider touch the body / context
@@ -78,9 +126,6 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			return nil, "retryOnFailure needs the whole body stored in the context"
 		}
 		return &StreamPlan{Passthrough: true}, ""
-	}
-	if c.firstByteTimeout != 0 {
-		return nil, "firstByteTimeout needs stream before the headers are released, and the field position is not under our control"
 	}
 	if c.typ == providerTypeVertex && apiName == ApiNameVertexRaw {
 		// Checked before IsOriginal on the buffered path too: the raw endpoints are normally used with the original protocol.
@@ -172,10 +217,8 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}), ApplyStream: true, ApplyModel: true}), ""
 
 	case c.typ == providerTypeQwen && !c.qwenEnableCompatible && apiName == ApiNameEmbeddings:
-		// onEmbeddingsRequestBody: parseRequestAndMapModel and buildQwenTextEmbeddingRequest; the path is header-phase work.
-		if c.providerBasePath != "" {
-			return nil, "providerBasePath needs :path changed in the body phase"
-		}
+		// onEmbeddingsRequestBody: parseRequestAndMapModel and buildQwenTextEmbeddingRequest; the path is header-phase
+		// work, and re-applying providerBasePath to it in the body phase changes nothing (applyProviderBasePath is idempotent).
 		p := &StreamPlan{Tr: streamxform.NewQwenEmbeddings(streamxform.EmbeddingsOptions{MapModel: c.mapStrict()}), ApplyModel: true, RequireModelBeforeCommit: true}
 		if ChatRequestTypeCheck {
 			p.Tr.SetFieldTree(embeddingsFieldTree)
@@ -186,9 +229,6 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		// native DashScope protocol: the buffered onChatCompletionRequestBody changes the path and headers by model / stream in the body phase
 		if !isChat {
 			return nil, "native qwen protocol streams chat completion only"
-		}
-		if c.providerBasePath != "" {
-			return nil, "providerBasePath needs :path changed in the body phase"
 		}
 		if len(c.qwenFileIds) > 0 {
 			return nil, "qwenFileIds inserts file messages into messages"
@@ -216,7 +256,7 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			// reproduce the header / path handling of onChatCompletionRequestBody
 			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
 			if strings.HasPrefix(model, qwenVlModelPrefixName) {
-				_ = util.OverwriteRequestPath(qwenMultimodalGenerationPath)
+				_ = util.OverwriteRequestPath(c.bodyPhasePath(qwenMultimodalGenerationPath))
 			}
 			if stream, _ := ctx.GetContext(ctxKeyIsStreaming).(bool); stream {
 				_ = proxywasm.ReplaceHttpRequestHeader("Accept", "text/event-stream")
@@ -236,15 +276,13 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		return p, ""
 
 	case c.typ == providerTypeQwen:
-		if c.providerBasePath != "" {
-			return nil, "providerBasePath needs :path changed in the body phase"
-		}
+		// providerBasePath: the path is header-phase work and its body-phase re-application is idempotent
 		if !inDefaultApis {
 			return nil, "this apiName is not covered by streaming"
 		}
 		opts := defaultOpts(&streamxform.QwenVariant{SupportsPreserveThinking: qwenSupportsPreserveThinking})
 		opts.ModelOnlyIfPresent = true
-		opts.DetectStream = false // the compatible branch does not call defaultTransformRequestBody: no Accept / isStreaming
+		opts.DetectStream = c.firstByteTimeout != 0 // no Accept / isStreaming on this branch; stream is only observed for the first-byte timeout
 		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}, ""
 
 	case c.typ == providerTypeMinimax && c.minimaxApiType == minimaxApiTypePro && isChat:
@@ -294,18 +332,15 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		if c.minimaxApiType == minimaxApiTypePro {
 			return nil, "the minimax Pro endpoint is not covered by streaming"
 		}
-		if c.providerBasePath != "" {
-			return nil, "providerBasePath needs :path changed in the body phase"
-		}
 		if !isChat {
 			return nil, "minimax streams chat completion only"
 		}
 		opts := defaultOpts(nil)
-		opts.DetectStream = false // this buffered branch sets neither Accept / isStreaming nor the model context keys
+		opts.DetectStream = c.firstByteTimeout != 0 // neither Accept / isStreaming nor the model context keys on this branch
 		p := &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false}
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			// the buffered path only switches to the v2 endpoint in the body phase (not in the header phase); the path is fixed and independent of body fields
-			if err := util.OverwriteRequestPath(minimaxChatCompletionV2Path); err != nil {
+			if err := util.OverwriteRequestPath(c.bodyPhasePath(minimaxChatCompletionV2Path)); err != nil {
 				log.Errorf("minimaxProvider: overwrite request path failed: %v", err)
 			}
 		}
