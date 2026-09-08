@@ -1059,6 +1059,16 @@ func (c *ProviderConfig) withClaudeInput(p *StreamPlan, apiName ApiName) (*Strea
 // does the same after it. Both stages reproduce json.Marshal's rendering, so the request the upstream sees is
 // the buffered one to the byte where it matters.
 func (c *ProviderConfig) openAIShape(opts streamxform.OpenAIOptions) streamxform.Xform {
+	var norm *streamxform.Transformer
+	if opts.ResponseFormat != nil && opts.NormalizeUsage {
+		// main.go adds stream_options.include_usage before the handler runs, so before the round trip: a
+		// stream_options carrying include_usage false loses it to omitempty and the buffered path does not add it
+		// back. The normalisation is a stage of its own in front, the protocol behind the round trip leaves it alone.
+		norm = streamxform.NewOpenAI(streamxform.OpenAIOptions{
+			MapModel: func(m string) string { return m }, ModelOnlyIfPresent: true, DetectStream: true, NormalizeUsage: true, DeveloperRoleSupported: true,
+		})
+		opts.NormalizeUsage = false
+	}
 	tr := streamxform.NewOpenAI(opts)
 	if opts.CheckMessages && ChatRequestTypeCheck {
 		tr.SetFieldTree(chatRequestFieldTree)
@@ -1066,6 +1076,9 @@ func (c *ProviderConfig) openAIShape(opts streamxform.OpenAIOptions) streamxform
 	var x streamxform.Xform = tr
 	if opts.ResponseFormat != nil {
 		x = streamxform.NewPipeline(streamxform.NewStructRoundTrip(chatRequestFieldTree, nil), x)
+		if norm != nil {
+			x = streamxform.NewPipeline(norm, x)
+		}
 	}
 	if opts.InsertSystem != nil {
 		x = streamxform.NewPipeline(x, streamxform.NewStructRoundTrip(chatRequestFieldTree, nil))

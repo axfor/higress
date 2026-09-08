@@ -6,7 +6,10 @@ package provider
 
 import (
 	"encoding/json"
+
 	"fmt"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"math/rand"
 	"strings"
 	"testing"
@@ -258,14 +261,25 @@ func TestSettingsBeforeClaude(t *testing.T) {
 func TestResponseJsonSchemaDifferential(t *testing.T) {
 	schema := map[string]interface{}{"type": "json_schema", "json_schema": map[string]interface{}{"name": "answer", "schema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"a": map[string]interface{}{"type": "string"}}}}}
 	cfg := ProviderConfig{typ: providerTypeOpenAI, responseJsonSchema: schema, modelMapping: oaiMapping}
+	// main.go's normalisation and handleRequestBody's developer conversion come first, then the openai
+	// TransformRequestBody: the decode, the schema, the marshal, and the default transform's model mapping
 	official := func(in string) (map[string]any, bool) {
+		body := testNormalizeUsage([]byte(in))
+		body, err := convertDeveloperRoleToSystem(body)
+		if err != nil {
+			return nil, false
+		}
 		req := &chatCompletionRequest{}
-		if err := decodeChatCompletionRequest([]byte(in), req); err != nil {
+		if err := decodeChatCompletionRequest(body, req); err != nil {
 			return nil, false
 		}
 		req.ResponseFormat = schema
 		b, _ := json.Marshal(req)
-		return officialOpenAI(string(b), oaiMapping, true)
+		b, ok := oaiDefaultModel(b, oaiMapping)
+		if !ok {
+			return nil, false
+		}
+		return toMap(b)
 	}
 	roundTrip := func(m map[string]any) map[string]any {
 		b, _ := json.Marshal(m)
@@ -335,27 +349,39 @@ func runXform(x streamxform.Xform, in string, chunk int) (map[string]any, bool, 
 	return m, true, ""
 }
 
-// stream_options.include_usage false is dropped by the buffered round trip's omitempty and then re-added as true
-// by normalizeOpenAiRequestBody; with the round-trip stage in front the streaming path does the same.
+// stream_options.include_usage false: main.go's normalisation sees it and leaves it, the round trip's omitempty
+// drops it, and nothing adds it back -- the buffered request carries an empty stream_options. The pipeline
+// normalises in front of the round trip and comes out the same.
 func TestResponseJsonSchemaIncludeUsageRoundTrip(t *testing.T) {
 	schema := map[string]interface{}{"type": "json_object"}
 	cfg := ProviderConfig{typ: providerTypeLongcat, responseJsonSchema: schema, modelMapping: oaiMapping}
 	in := `{"model":"m1","messages":[{"role":"user","content":"U"}],"stream":true,"stream_options":{"include_usage":false,"x":1},"foo":{"bar":[1,2]}}`
+	body := testNormalizeUsage([]byte(in))
 	req := &chatCompletionRequest{}
-	require.NoError(t, decodeChatCompletionRequest([]byte(in), req))
+	require.NoError(t, decodeChatCompletionRequest(body, req))
 	req.ResponseFormat = schema
 	b, _ := json.Marshal(req)
-	off, ok := officialOpenAI(string(b), oaiMapping, true)
+	b, ok := oaiDefaultModel(b, oaiMapping)
 	require.True(t, ok)
-	require.Equal(t, map[string]any{"include_usage": true}, off["stream_options"])
+	off, ok := toMap(b)
+	require.True(t, ok)
+	require.Equal(t, map[string]any{}, off["stream_options"])
 	x := cfg.openAIShape(streamxform.OpenAIOptions{
 		MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
 		DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeLongcat), CheckMessages: true, ResponseFormat: cfg.streamResponseFormat(),
 	})
 	str, ok, why := runXform(x, in, 7)
 	require.True(t, ok, why)
-	require.Equal(t, map[string]any{"include_usage": true}, str["stream_options"])
+	require.Equal(t, map[string]any{}, str["stream_options"])
 	_, hasFoo := str["foo"]
 	require.False(t, hasFoo, "a field the struct lacks is dropped, as the buffered path drops it")
 	require.Empty(t, diffMaps(off, str))
+}
+
+// testNormalizeUsage is main.go's normalizeOpenAiRequestBody with usage statistics enabled.
+func testNormalizeUsage(body []byte) []byte {
+	if gjson.GetBytes(body, "stream").Bool() && (!gjson.GetBytes(body, "stream_options").Exists() || !gjson.GetBytes(body, "stream_options.include_usage").Exists()) {
+		body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
+	}
+	return body
 }

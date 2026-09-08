@@ -944,10 +944,10 @@ func TestStreamingRequest_ResponseJsonSchema(t *testing.T) {
 				require.Equal(t, "json_schema", out["response_format"].(map[string]any)["type"], c.name)
 				require.Equal(t, "answer", out["response_format"].(map[string]any)["json_schema"].(map[string]any)["name"], c.name)
 				require.Equal(t, "gpt-4o", out["model"], c.name)
-				if c.name == "chat" { // the buffered round trip: unknown fields dropped, include_usage false becomes true
+				if c.name == "chat" { // the buffered round trip: unknown fields dropped, include_usage false dropped and not re-added
 					_, hasFoo := out["foo"]
 					require.False(t, hasFoo)
-					require.Equal(t, map[string]any{"include_usage": true}, out["stream_options"])
+					require.Equal(t, map[string]any{}, out["stream_options"])
 				}
 				require.Equal(t, "/v1/chat/completions", requestHeader(host, ":path"), c.name)
 			}()
