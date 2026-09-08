@@ -135,6 +135,7 @@ func parseGlobalConfig(json gjson.Result, pluginConfig *config.PluginConfig) err
 		log.Errorf("failed to apply global rule config: %v", err)
 		return err
 	}
+	applyStreamTuning(json)
 
 	return nil
 }
@@ -382,6 +383,54 @@ func onHttpStreamingRequestBody(ctx wrapper.HttpContext, pluginConfig config.Plu
 
 const ctxKeyXformState = "aip_xform_state"
 
+// Tuning knobs for the streaming path, read from the plugin config.
+//
+// Both are operational levers with measured effect and no behavioural consequence, so they are configuration
+// rather than constants. The commit window bounds what one in-flight request holds before anything is
+// released: 64KB down to 16KB cuts that to a quarter, at the cost of falling back more often, because a shape
+// the transform cannot handle has to be found inside the window to be recoverable. The GC floor is the heap
+// size below which the watchdog never forces a collection: 64MB down to 32MB halves the fixed floor each wasm
+// VM sits at, at the cost of collecting more often.
+//
+// Zero means "leave the default": 64KB for the window (streamxform.CommitBytes), 64MB for the floor
+// (wrapper.GCWatchdogFloor).
+var streamCommitWindowBytes int
+
+// applyStreamTuning reads the two knobs. Out-of-range values are logged and ignored rather than clamped: a
+// wrong number in a config should be visible, not silently turned into a different one.
+func applyStreamTuning(json gjson.Result) {
+	if v := json.Get("streamCommitWindowBytes"); v.Exists() {
+		n := int(v.Int())
+		switch {
+		case n == 0:
+			streamCommitWindowBytes = 0
+		case n < 4<<10 || n > 1<<20:
+			log.Errorf("streamCommitWindowBytes %d out of range [4096, 1048576], keeping %d", n, effectiveCommitWindow())
+		default:
+			streamCommitWindowBytes = n
+		}
+	}
+	if v := json.Get("streamGcFloorBytes"); v.Exists() {
+		n := v.Int()
+		switch {
+		case n == 0:
+			wrapper.GCWatchdogFloor = 64 << 20
+		case n < 8<<20 || n > 512<<20:
+			log.Errorf("streamGcFloorBytes %d out of range [8388608, 536870912], keeping %d", n, wrapper.GCWatchdogFloor)
+		default:
+			wrapper.GCWatchdogFloor = uint64(n)
+		}
+	}
+	log.Infof("streaming tuning: commit window %d bytes, gc floor %d bytes", effectiveCommitWindow(), wrapper.GCWatchdogFloor)
+}
+
+func effectiveCommitWindow() int {
+	if streamCommitWindowBytes > 0 {
+		return streamCommitWindowBytes
+	}
+	return streamxform.CommitBytes
+}
+
 // Admission control for the streaming path.
 //
 // Buffering the whole body has a side effect the streaming path loses: it caps how many requests are being
@@ -520,6 +569,9 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 	streamInflight++
 	ctx.SetContext(ctxKeyAdmitted, true)
 	ctx.SetContext(ctxKeyAdmitStart, time.Now().UnixNano())
+	if streamCommitWindowBytes > 0 && plan.Tr != nil {
+		plan.Tr.SetCommitBytes(streamCommitWindowBytes) // before the first Write, which happens in Feed
+	}
 	x.plan = plan
 	x.st = guard.New(&guard.Plan{
 		Tr:          plan.Tr,
