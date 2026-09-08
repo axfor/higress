@@ -38,6 +38,13 @@ type Plan struct {
 	OnCommit func(pre streamxform.Prelude, last bool) bool
 	// OnFinish is called when the whole body has been handled (last chunk).
 	OnFinish func(pre streamxform.Prelude)
+	// EarlyCommit, when set, is asked after every chunk before the commit window has filled. Returning true
+	// commits right away: the headers and the output accumulated so far are released, and from here on a
+	// shape the transform cannot handle fails the request instead of falling back. A plan returns true once it
+	// has seen every field its headers depend on -- model for a path that carries it, stream for a header
+	// that does -- because after that the retreat the window keeps open is one it would never take. The
+	// window then bounds only the documents where that moment never comes.
+	EarlyCommit func(pre streamxform.Prelude) bool
 	// Fallback is the plugin's buffered path, called once the whole body is collected. If the buffered handler calls
 	// ReplaceHttpRequestBody itself, the driver reads that content back and returns it. ActionPause means the handler answered locally or waits for an async result.
 	Fallback func(body []byte) types.Action
@@ -187,6 +194,10 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	}
 	s.out = s.out[:0]
 	tr.Write(chunk)
+	if !last && !tr.Committed() && s.plan.EarlyCommit != nil && s.plan.EarlyCommit(Prelude(tr)) {
+		s.metric("early_commit")
+		tr.CommitNow() // releases what has accumulated through the sink, so out is ready below
+	}
 	if last {
 		tr.Finish() // the remaining output arrives through the sink as well
 	}

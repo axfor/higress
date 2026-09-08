@@ -325,3 +325,57 @@ func TestPrefixTransformOnFinishKeepsThePrelude(t *testing.T) {
 		t.Fatalf("OnFinish 拿到的 prelude 与提交时不一致：%+v vs %+v", atFinish, atCommit)
 	}
 }
+
+// 提前提交只改变何时释放，不改变释放什么：有 EarlyCommit 的输出必须与没有的逐字节相同，
+// 而且第一个带 model 的块之后就该放行，不再等 64KB。
+func TestEarlyCommitReleasesOnceModelSeen(t *testing.T) {
+	body := []byte(`{"model":"p/m1","messages":[{"role":"user","content":"` + big(200<<10) + `"}],"max_tokens":16}`)
+	stubHost(t, body)
+	mk := func(early bool) *State {
+		tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{MapModel: func(m string) string {
+			if i := strings.Index(m, "/"); i >= 0 {
+				return m[i+1:]
+			}
+			return m
+		}})
+		p := &Plan{Tr: tr, Mode: Transform,
+			OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen }}
+		if early {
+			p.EarlyCommit = func(pre streamxform.Prelude) bool { return pre.ModelSeen }
+		}
+		return New(p)
+	}
+	want := strings.Replace(string(body), `"model":"p/m1"`, `"model":"m1"`, 1)
+
+	// 无提前提交：第一块（4KB）必须 Pause —— 还没到 64KB
+	s0 := mk(false)
+	if _, a := s0.Feed(body[:4096], false); a != types.ActionPause {
+		t.Fatalf("没有 EarlyCommit 时第一块应当 Pause，得到 %v", a)
+	}
+	// 有提前提交：model 在第一块里，第一块就该 Continue 并放出内容
+	s1 := mk(true)
+	o, a := s1.Feed(body[:4096], false)
+	if a != types.ActionContinue || len(o) == 0 {
+		t.Fatalf("EarlyCommit 应当在第一块就放行，得到 action=%v out=%d", a, len(o))
+	}
+	// 整份跑完必须与无提前提交的结果逐字节一致
+	full := func(s *State) string {
+		var out []byte
+		for i := 0; i < len(body); i += 4096 {
+			j := i + 4096
+			if j > len(body) {
+				j = len(body)
+			}
+			o, _ := s.Feed(body[i:j], j == len(body))
+			out = append(out, o...)
+		}
+		return string(out)
+	}
+	stubHost(t, body)
+	if got := full(mk(true)); got != want {
+		t.Fatalf("提前提交改变了输出：%d vs %d", len(got), len(want))
+	}
+	if got := full(mk(false)); got != want {
+		t.Fatalf("参照本身不对：%d vs %d", len(got), len(want))
+	}
+}

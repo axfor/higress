@@ -59,9 +59,12 @@ func newStream(ctx wrapper.HttpContext, config ModelRouterConfig) *guard.State {
 		Tr:       tr,
 		Mode:     guard.PrefixTransform,
 		OnCommit: r.commit,
-		Fallback: func(body []byte) types.Action { return onHttpRequestBody(ctx, config, body) },
-		Metric:   streamMetric,
-		Log:      log.Warnf,
+		// The only field the headers depend on is model; once it has been seen and the request is not one
+		// the buffered path has to handle whole, holding a window's worth of bytes buys nothing.
+		EarlyCommit: func(streamxform.Prelude) bool { return r.modelOK && !r.needFull },
+		Fallback:    func(body []byte) types.Action { return onHttpRequestBody(ctx, config, body) },
+		Metric:      streamMetric,
+		Log:         log.Warnf,
 	})
 }
 
