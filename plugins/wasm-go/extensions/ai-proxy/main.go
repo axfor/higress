@@ -728,6 +728,10 @@ func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
 		log.Warnf("[stream-xform] fields required by the request path not seen before the commit point, falling back to the buffered path")
 		return false
 	}
+	if x.plan.CommitGate != nil && !x.plan.CommitGate(pre, last) {
+		log.Warnf("[stream-xform] a fact the request path depends on is not settled before the commit point, falling back to the buffered path")
+		return false
+	}
 	x.cfg.GetProviderConfig().StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, true)
 	if x.plan.AfterPrelude != nil {
 		x.plan.AfterPrelude(x.ctx, pre)

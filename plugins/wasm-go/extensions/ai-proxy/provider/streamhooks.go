@@ -42,6 +42,10 @@ type StreamPlan struct {
 	AfterPrelude func(ctx wrapper.HttpContext, pre streamxform.Prelude)
 	// OnFinish is called after the whole body has been scanned: context keys that are only known at the end and only used on the response side.
 	OnFinish func(ctx wrapper.HttpContext)
+	// CommitGate, when set, is asked before the headers are released: false while a fact the headers depend on
+	// (an image key deciding Kling's path) can still turn up later in the body; that is a fallback unless the
+	// whole body has been seen.
+	CommitGate func(pre streamxform.Prelude, last bool) bool
 	// Replan picks the real transformer once model is known, for providers whose wire format depends on the mapped
 	// model (Vertex: a claude-prefixed model takes the Anthropic format, anything else the Gemini one). Tr is then only
 	// a probe for model. See guard.Plan.Replan.
@@ -424,6 +428,44 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		return p, ""
 
+	case c.typ == providerTypeDeepl && isChat:
+		// deeplTextGenRequest: non-system messages become text entries, the system message context, target_lang from the
+		// setting. model is not mapped -- it selects the host and must be Free or Pro -- and only finalRequestModel is written.
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewDeepL(streamxform.DeepLOptions{TargetLang: c.targetLang}), RequireModelBeforeCommit: true})
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			ctx.SetContext(ctxKeyFinalRequestModel, pre.Model)
+			host := deeplHostFree
+			if pre.Model == "Pro" {
+				host = deeplHostPro
+			}
+			_ = proxywasm.ReplaceHttpRequestHeader(util.HeaderAuthority, host)
+		}
+		return p, ""
+
+	case c.typ == providerTypeKling && apiName == ApiNameVideos:
+		// transformOpenAIVideoRequest: the body passes through, model (or model_name) is mapped into model_name and model
+		// removed; the path depends on whether an image input key is present, which only the whole body can deny.
+		kp, ok := prov.(*klingOpenAIProvider)
+		if !ok {
+			return nil, "unexpected kling provider instance type"
+		}
+		tr := streamxform.NewKling(streamxform.KlingOptions{MapModel: mapLenient})
+		kproto := tr.Protocol().(interface{ ImageToVideo() bool })
+		p := &StreamPlan{Tr: tr, ApplyModel: true,
+			CommitGate: func(pre streamxform.Prelude, last bool) bool { return last || kproto.ImageToVideo() }}
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			taskType, target := klingTaskTypeTextToVideo, kp.textCreateVideoPath()
+			if kproto.ImageToVideo() {
+				taskType, target = klingTaskTypeImageToVideo, kp.imageCreateVideoPath()
+			}
+			ctx.SetContext(ctxKeyKlingVideoTaskType, taskType)
+			cur, _ := proxywasm.GetHttpRequestHeader(util.HeaderPath)
+			if err := util.OverwriteRequestPath(c.bodyPhasePath(klingPathWithOriginalQuery(ctx, cur, target))); err != nil {
+				log.Errorf("klingProvider: overwrite request path failed: %v", err)
+			}
+		}
+		return p, ""
+
 	case c.typ == providerTypeCohere && isChat:
 		// buildCohereRequest rebuilds the request from the first message's text and a handful of scalars; the
 		// Accept header set by parseRequestAndMapModel stays, cohere transforms the body without a header snapshot.
@@ -539,6 +581,15 @@ func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName 
 	if plan.ApplyStream && !pre.StreamSeen {
 		ctx.SetContext(ctxKeyIsStreaming, false)
 	}
+}
+
+// bodyPhasePath reproduces what handleRequestBody does to a path a TransformRequestBodyHeaders handler set: the
+// configured providerBasePath is applied to it again, as the header phase applied it to the original path.
+func (c *ProviderConfig) bodyPhasePath(path string) string {
+	if c.providerBasePath != "" {
+		return c.applyProviderBasePath(path)
+	}
+	return path
 }
 
 // mapStrict reproduces mapModel for transformers that build the request from scratch: a missing model and a

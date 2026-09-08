@@ -393,3 +393,52 @@ func TestStreamingRequest_CohereChat(t *testing.T) {
 		require.Equal(t, "text/event-stream", requestHeader(host, "Accept"))
 	})
 }
+
+var streamingDeepLConfig = json.RawMessage(`{"provider":{"type":"deepl","apiTokens":["dk"],"targetLang":"ZH"}}`)
+var streamingKlingConfig = json.RawMessage(`{"provider":{"type":"kling","apiTokens":["kk"],"modelMapping":{"m":"kling-v2-master"}}}`)
+
+// DeepL: messages become the text array, the system message the context, the host follows model.
+func TestStreamingRequest_DeepL(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingDeepLConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		text := strings.Repeat("d", 100000)
+		body := `{"model":"Pro","messages":[{"role":"system","content":"S"},{"role":"user","content":"` + text + `"},{"role":"user","content":"more"}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, []any{text, "more"}, out["text"])
+		require.Equal(t, "ZH", out["target_lang"])
+		require.Equal(t, "S", out["context"])
+		require.Equal(t, "api.deepl.com", requestHeader(host, ":authority"))
+		require.Equal(t, "/v2/translate", requestHeader(host, ":path"))
+	})
+}
+
+// Kling: the body passes through with model mapped into model_name; an image key sends it to the image-to-video path.
+func TestStreamingRequest_KlingVideos(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		for _, c := range []struct{ body, path, task string }{
+			{`{"model":"m","prompt":"a cat","duration":"5"}`, "/v1/videos/text2video", "text2video"},
+			{`{"prompt":"a cat","image":"data:image/png;base64,AAAA","model_name":"k"}`, "/v1/videos/image2video", "image2video"},
+		} {
+			host, status := wasmtest.NewTestHost(streamingKlingConfig)
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/videos"))
+			require.Equal(t, types.ActionContinue, host.CallOnHttpStreamingRequestBody([]byte(c.body), true))
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(host.GetRequestBody(), &out))
+			_, hasModel := out["model"]
+			require.False(t, hasModel, c.body)
+			require.Contains(t, []any{"kling-v2-master", "k"}, out["model_name"], c.body)
+			require.Equal(t, "a cat", out["prompt"])
+			require.Equal(t, c.path, requestHeader(host, ":path"), c.body)
+			host.Reset()
+		}
+	})
+}
