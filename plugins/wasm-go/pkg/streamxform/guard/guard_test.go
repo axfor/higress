@@ -1,6 +1,8 @@
 package guard
 
 import (
+	"math/rand"
+	"sort"
 	"strings"
 	"testing"
 
@@ -222,4 +224,76 @@ func tailOf(s string) string {
 		return s[len(s)-24:]
 	}
 	return s
+}
+
+// 上一个测试用的是 Envoy 那一次的切分点。真正要守住的性质与切分无关：无论请求体怎么分块，
+// 也无论宿主是把 end_of_stream 挂在最后一块上还是单独再回调一次，转发出去的字节都必须是完整的。
+// 截断缺陷正是只在某些切分下出现（提交点与根闭合落在同一块），逐点扫一遍才不会再漏。
+func TestPrefixTransformIsCompleteUnderAnySplit(t *testing.T) {
+	body := []byte(`{"model":"p/m1","messages":[{"role":"user","content":"` + big(70000) + `"}],"max_tokens":16}` + "\n")
+	want := strings.Replace(string(body), `"model":"p/m1"`, `"model":"m1"`, 1)
+
+	run := func(t *testing.T, splits []int, eosSeparate bool) {
+		t.Helper()
+		stubHost(t, body)
+		tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{MapModel: func(m string) string {
+			if i := strings.Index(m, "/"); i >= 0 {
+				return m[i+1:]
+			}
+			return m
+		}})
+		s := New(&Plan{Tr: tr, Mode: PrefixTransform,
+			OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen },
+		})
+		var out []byte
+		prev := 0
+		for i, cut := range splits {
+			last := !eosSeparate && i == len(splits)-1
+			o, _ := s.Feed(body[prev:cut], last)
+			out = append(out, o...)
+			prev = cut
+		}
+		if eosSeparate {
+			o, _ := s.Feed(nil, true)
+			out = append(out, o...)
+		}
+		if string(out) != want {
+			t.Fatalf("splits=%v eos单独=%v: 输出 %d 字节，应为 %d；尾部 %q vs %q",
+				splits, eosSeparate, len(out), len(want), tailOf(string(out)), tailOf(want))
+		}
+	}
+
+	// 两块：切点扫过提交点附近的每一个位置，这里最容易让根闭合和提交点撞在一起
+	for cut := 60 << 10; cut < len(body); cut += 97 {
+		for _, sep := range []bool{true, false} {
+			run(t, []int{cut, len(body)}, sep)
+		}
+	}
+	// 三块：第二刀落在提交点前后，第三块同时跨过提交点并带上根闭合
+	for a := 30 << 10; a < 34<<10; a += 251 {
+		for b := 63 << 10; b < 67<<10; b += 251 {
+			if b <= a {
+				continue
+			}
+			for _, sep := range []bool{true, false} {
+				run(t, []int{a, b, len(body)}, sep)
+			}
+		}
+	}
+	// 随机切分：块数与位置都随机，兜住上面没枚举到的形状
+	rnd := rand.New(rand.NewSource(7))
+	for i := 0; i < 200; i++ {
+		n := 1 + rnd.Intn(6)
+		cuts := map[int]bool{}
+		for j := 0; j < n; j++ {
+			cuts[1+rnd.Intn(len(body)-1)] = true
+		}
+		var splits []int
+		for c := range cuts {
+			splits = append(splits, c)
+		}
+		sort.Ints(splits)
+		splits = append(splits, len(body))
+		run(t, splits, i%2 == 0)
+	}
 }
