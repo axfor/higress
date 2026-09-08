@@ -359,3 +359,37 @@ func TestStreamingRequest_VertexChatGeminiModelFallsBack(t *testing.T) {
 		require.Contains(t, requestHeader(host, ":path"), "key=vk")
 	})
 }
+
+var streamingCohereConfig = json.RawMessage(`{"provider":{"type":"cohere","apiTokens":["ck"],"modelMapping":{"m":"command-r-plus"}}}`)
+
+// Cohere rebuilds the request from the first message's text and a few scalars; everything else is dropped.
+func TestStreamingRequest_CohereChat(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingCohereConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		text := strings.Repeat("q", 100000)
+		// stream before the large message: past the window the Accept header can no longer be rewritten (documented)
+		body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"` + text + `"},{"role":"assistant","content":"dropped"}],"n":2,"top_p":0.5,"stop":["x"],"user":"u"}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, text, out["message"])
+		require.Equal(t, "command-r-plus", out["model"])
+		require.Equal(t, true, out["stream"])
+		require.Equal(t, float64(2), out["k"])
+		require.Equal(t, 0.5, out["p"])
+		require.Equal(t, []any{"x"}, out["stop_sequences"])
+		_, hasMessages := out["messages"]
+		require.False(t, hasMessages)
+		_, hasUser := out["user"]
+		require.False(t, hasUser)
+		require.Equal(t, "api.cohere.com", requestHeader(host, ":authority"))
+		require.Equal(t, "/v1/chat", requestHeader(host, ":path"))
+		require.Equal(t, "text/event-stream", requestHeader(host, "Accept"))
+	})
+}

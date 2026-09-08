@@ -424,6 +424,12 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		return p, ""
 
+	case c.typ == providerTypeCohere && isChat:
+		// buildCohereRequest rebuilds the request from the first message's text and a handful of scalars; the
+		// Accept header set by parseRequestAndMapModel stays, cohere transforms the body without a header snapshot.
+		return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewCohere(streamxform.CohereOptions{MapModel: c.mapStrict()}),
+			ApplyStream: true, ApplyModel: true, RequireModelBeforeCommit: true}), ""
+
 	case c.typ == providerTypeBedrock && apiName == ApiNameAnthropicMessages && len(c.apiTokens) > 0:
 		// Mantle keeps the Anthropic body: the buffered onAnthropicMessagesRequestBody reads stream for the Accept header
 		// and maps model, nothing else. With API tokens there is no SigV4 over the body; with AK/SK there is, so no plan.
@@ -532,6 +538,21 @@ func (c *ProviderConfig) StreamApplyPrelude(ctx wrapper.HttpContext, apiName Api
 func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName ApiName, plan *StreamPlan, pre streamxform.Prelude) {
 	if plan.ApplyStream && !pre.StreamSeen {
 		ctx.SetContext(ctxKeyIsStreaming, false)
+	}
+}
+
+// mapStrict reproduces mapModel for transformers that build the request from scratch: a missing model and a
+// mapping to the empty string both fail, as the buffered decode does.
+func (c *ProviderConfig) mapStrict() func(string) (string, error) {
+	return func(m string) (string, error) {
+		if m == "" {
+			return "", errors.New("missing model in request")
+		}
+		mapped := getMappedModel(m, c.modelMapping)
+		if mapped == "" {
+			return "", errors.New("model becomes empty after applying the configured mapping")
+		}
+		return mapped, nil
 	}
 }
 
