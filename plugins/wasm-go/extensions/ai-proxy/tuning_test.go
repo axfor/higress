@@ -153,3 +153,48 @@ func TestAdmissionBudgetIsNeverExceeded(t *testing.T) {
 		}
 	}
 }
+
+// 准入把超出上限的请求赶去缓冲路径，而缓冲路径持有的是整份 body、流式持有的是一个窗口。
+// 所以"回落"只在两者相当时才划算；body 远大于窗口时回落反而更费内存，实测在 1MB/256KB 上
+// 多花了 170MB 的 Envoy 堆并损失三分之一吞吐。
+func TestAdmissionDivertsOnlyWhenBufferingIsNotMoreExpensive(t *testing.T) {
+	log.SetPluginLog(quietLog{})
+	t.Cleanup(func() { streamCommitWindowBytes = 0 })
+
+	cases := []struct {
+		name       string
+		window     int
+		declared   int64
+		wantDivert bool
+	}{
+		{"体积未声明：维持原行为", 64 << 10, 0, true},
+		{"body 等于窗口", 64 << 10, 64 << 10, true},
+		{"body 两倍窗口：仍在可比范围", 64 << 10, 128 << 10, true},
+		{"body 略超两倍：不再回落", 64 << 10, (128 << 10) + 1, false},
+		{"1MB body 对 256KB 窗口", 256 << 10, 1 << 20, false},
+		{"1MB body 对 1MB 窗口", 1 << 20, 1 << 20, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			streamCommitWindowBytes = c.window
+			ctx := newTuningCtx()
+			if c.declared > 0 {
+				ctx.SetContext(ctxKeyDeclaredBodyBytes, c.declared)
+			}
+			if got := admDivert(ctx); got != c.wantDivert {
+				t.Errorf("回落判定 = %v，应为 %v（窗口 %d，声明体积 %d）",
+					got, c.wantDivert, c.window, c.declared)
+			}
+		})
+	}
+}
+
+// 只需要上下文读写的最小实现。
+type tuningCtx struct {
+	wrapper.HttpContext
+	m map[string]interface{}
+}
+
+func newTuningCtx() *tuningCtx                          { return &tuningCtx{m: map[string]interface{}{}} }
+func (c *tuningCtx) SetContext(k string, v interface{}) { c.m[k] = v }
+func (c *tuningCtx) GetContext(k string) interface{}    { return c.m[k] }

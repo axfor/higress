@@ -318,6 +318,13 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 		}
 
 		if hasRequestBody && hasRequestBodyHandler {
+			// Keep the declared size before dropping the header: admission needs it to tell whether diverting
+			// a request to the buffered path would cost more memory than admitting it.
+			if v, err := proxywasm.GetHttpRequestHeader(headerContentLength); err == nil {
+				if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+					ctx.SetContext(ctxKeyDeclaredBodyBytes, n)
+				}
+			}
 			_ = proxywasm.RemoveHttpRequestHeader(headerContentLength)
 			ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
 			// Delay the header processing to allow changing in OnRequestBody
@@ -546,9 +553,32 @@ func admOnDone(dur int64) {
 }
 
 const (
-	ctxKeyAdmitted   = "aip_xform_admitted"
-	ctxKeyAdmitStart = "aip_xform_admit_start"
+	ctxKeyAdmitted          = "aip_xform_admitted"
+	ctxKeyAdmitStart        = "aip_xform_admit_start"
+	ctxKeyDeclaredBodyBytes = "aip_declared_body_bytes"
 )
+
+// admDivertRatio: past the limit a request is only diverted to the buffered path while its body is no larger
+// than this many commit windows.
+//
+// Diverting is not free, and which way it costs depends on the body. The buffered path holds the whole body;
+// the streaming path holds one window. Measured on the gateway: at 70KB bodies against a 64KB window --
+// the two nearly equal -- diverting the excess at 5000 concurrency held 170MB less, because bytes move from
+// wasm linear memory, which never shrinks, into Envoy's buffer, which does. At 1MB bodies against a 256KB
+// window -- four times the window -- diverting 576 of 1857 requests instead cost 170MB more of Envoy heap
+// (363MB against 190MB) and a third of the throughput. So the excess is diverted only while the two are
+// comparable, and otherwise admitted: streaming a request the limit would have refused still holds less than
+// buffering it.
+const admDivertRatio = 2
+
+// admDivert reports whether a request past the limit should go to the buffered path.
+func admDivert(ctx wrapper.HttpContext) bool {
+	n, _ := ctx.GetContext(ctxKeyDeclaredBodyBytes).(int64)
+	if n <= 0 {
+		return true // size not declared: keep the original behaviour
+	}
+	return n <= int64(admDivertRatio*effectiveCommitWindow())
+}
 
 // onStreamDone releases the admission slot. It runs even when the client aborts mid-upload, which the body
 // hooks do not see; without it a few aborted requests would leak slots and pin the plugin to the buffered path.
@@ -617,9 +647,13 @@ func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState
 		return fallbackOnly()
 	}
 	if float64(streamInflight) >= admLimit() {
-		// Too many uploads in flight already: keep this one on the buffered path.
-		streamXformCount("admission_fallback")
-		return fallbackOnly()
+		if admDivert(ctx) {
+			// Too many uploads in flight already, and buffering this one costs no more than streaming it.
+			streamXformCount("admission_fallback")
+			return fallbackOnly()
+		}
+		// Past the limit, but this body is large enough that buffering it would hold more than streaming it.
+		streamXformCount("admission_admitted_oversize")
 	}
 	streamInflight++
 	ctx.SetContext(ctxKeyAdmitted, true)
