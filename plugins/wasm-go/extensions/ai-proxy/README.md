@@ -42,6 +42,7 @@ description: AI 代理插件配置参考
 - `generic`（请求体逐块直接放行）；Claude 原生接口（`/v1/messages`、`/v1/complete`、embeddings）以及上述透传供应商的其他 JSON 接口（images / audio / responses / videos / fine-tuning 等）。multipart 请求仍走全量路径；
 - Gemini 原生 `generateContent` / `streamGenerateContent`（全量路径本就不改 body，逐块放行）；
 - `protocol: original` 的所有供应商（全量路径在 original 下不碰 body），例外是对 body 签名的 hunyuan 与 AK/SK 模式的 bedrock，以及在 original 下同样重建 body 的 Pro 接口模式 minimax；
+- bedrock Converse 的 chat（apiTokens 模式；OpenAI → Converse 整份映射：system 块、toolUse / toolResult 块与合并、data URL 图片、inferenceConfig / thinking / toolConfig；配置了 prompt cache 且模型支持时回落，缓存点要落在最后一条 user 消息上）；
 - bedrock Mantle `/v1/messages`（apiTokens 模式，只做模型映射与 Accept 头；AK/SK 模式要对 body 做 SigV4 签名，仍走全量）；
 - vertex 原生 REST 直通（Express 模式 API key 进 query；标准模式在 OAuth token 已缓存时流式，冷启动后第一个请求由全量路径取 token）；
 - vertex 的 `/v1/messages` 直通（Anthropic body 原样送 `:rawPredict` / `:streamRawPredict`，只删 `model`、补 `anthropic_version` 与默认 `max_tokens`、去掉 `context_management`；路径依赖 model 与 stream，二者须出现在窗口内）；
@@ -54,7 +55,7 @@ description: AI 代理插件配置参考
 - `kling` 的 `/v1/videos`（body 原样，`model` 映射进 `model_name`；路径由是否带图片输入字段决定，body 超过窗口且尚未见到图片字段时回落）；
 - vertex 的 chat（OpenAI → Anthropic 格式或 Vertex 自己的 Gemini 格式，按映射后的模型选择）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内。Gemini 格式下 assistant 消息的内容要等 `tool_calls` 到齐（超过 1MB 回落），含 http(s) 图片链接的 URL 须在 8KB 内。
 
-其余供应商（Vertex 的 embeddings / 生图、Bedrock Converse、Hunyuan）以及配置了
+其余供应商（Vertex 的 embeddings / 生图、AK/SK 模式的 Bedrock、Hunyuan）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
 `firstByteTimeout` / `responseJsonSchema` / `providerBasePath`（qwen、minimax）/ `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 

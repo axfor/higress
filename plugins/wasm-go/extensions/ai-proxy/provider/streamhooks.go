@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -534,6 +535,34 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		// Accept header set by parseRequestAndMapModel stays, cohere transforms the body without a header snapshot.
 		return checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewCohere(streamxform.CohereOptions{MapModel: c.mapStrict()}),
 			ApplyStream: true, ApplyModel: true, RequireModelBeforeCommit: true}), ""
+
+	case c.typ == providerTypeBedrock && isChat && len(c.apiTokens) > 0:
+		// Converse with API tokens: no SigV4 over the body. onChatCompletionRequestBody sets the path from model and
+		// stream, pins Accept to */* on the header snapshot and rebuilds the request (buildBedrockTextGenerationRequest).
+		bp, ok := prov.(*bedrockProvider)
+		if !ok {
+			return nil, "unexpected bedrock provider instance type"
+		}
+		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewBedrock(streamxform.BedrockOptions{
+			MapModel:             c.mapStrict(),
+			AdditionalFields:     c.bedrockAdditionalFields,
+			PromptCacheRetention: c.promptCacheRetention,
+			PromptCacheSupported: isPromptCacheSupportedModel,
+		}), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true, RequireStreamBeforeCommit: true})
+		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
+			model := ctx.GetStringContext(ctxKeyFinalRequestModel, "")
+			format := bedrockChatCompletionPath
+			if pre.Stream {
+				format = bedrockStreamChatCompletionPath
+			}
+			hdr := http.Header{}
+			bp.overwriteRequestPathHeader(hdr, format, model)
+			if err := util.OverwriteRequestPath(c.bodyPhasePath(hdr.Get(util.HeaderPath))); err != nil {
+				log.Errorf("bedrockProvider: overwrite request path failed: %v", err)
+			}
+			_ = proxywasm.ReplaceHttpRequestHeader("Accept", "*/*")
+		}
+		return p, ""
 
 	case c.typ == providerTypeBedrock && apiName == ApiNameAnthropicMessages && len(c.apiTokens) > 0:
 		// Mantle keeps the Anthropic body: the buffered onAnthropicMessagesRequestBody reads stream for the Accept header

@@ -532,3 +532,33 @@ func TestStreamingRequest_Triton(t *testing.T) {
 		require.Equal(t, "triton.local", requestHeader(host, ":authority"))
 	})
 }
+
+var streamingBedrockConverseConfig = json.RawMessage(`{"provider":{"type":"bedrock","apiTokens":["bk"],"awsRegion":"us-east-1","modelMapping":{"m":"anthropic.claude-3-5-sonnet-20241022-v2:0"}}}`)
+
+// Bedrock Converse with API tokens: the request is rebuilt in the Converse shape; path and Accept follow the buffered path.
+func TestStreamingRequest_BedrockConverse(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingBedrockConverseConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		text := strings.Repeat("c", 100000)
+		body := `{"model":"m","stream":true,"messages":[{"role":"system","content":"S"},{"role":"user","content":"` + text + `"}],"max_tokens":64,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0])
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, []any{map[string]any{"text": "S"}}, out["system"])
+		msgs := out["messages"].([]any)
+		require.Len(t, msgs, 1)
+		require.Equal(t, text, msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"])
+		require.Equal(t, float64(64), out["inferenceConfig"].(map[string]any)["maxTokens"])
+		require.Equal(t, "standard", out["performanceConfig"].(map[string]any)["latency"])
+		require.Contains(t, out["toolConfig"].(map[string]any)["toolChoice"], "auto")
+		require.Equal(t, "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse-stream", requestHeader(host, ":path"))
+		require.Equal(t, "*/*", requestHeader(host, "Accept"))
+		require.Equal(t, "bedrock-runtime.us-east-1.amazonaws.com", requestHeader(host, ":authority"))
+	})
+}
