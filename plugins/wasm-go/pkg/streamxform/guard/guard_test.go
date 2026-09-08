@@ -297,3 +297,31 @@ func TestPrefixTransformIsCompleteUnderAnySplit(t *testing.T) {
 		run(t, splits, i%2 == 0)
 	}
 }
+
+// PrefixTransform 释放之后会丢掉转换器，后续分块原样透传。此时 OnFinish 仍然要拿到协议扫出来的
+// prelude —— 从已经置空的转换器上读会静默得到零值，调用方看不出任何异常。
+func TestPrefixTransformOnFinishKeepsThePrelude(t *testing.T) {
+	body := []byte(`{"model":"p/m1","stream":true,"messages":[{"role":"user","content":"` + big(200<<10) + `"}]}`)
+	stubHost(t, body)
+	tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{MapModel: func(m string) string {
+		if i := strings.Index(m, "/"); i >= 0 {
+			return m[i+1:]
+		}
+		return m
+	}})
+	var atCommit, atFinish streamxform.Prelude
+	s := New(&Plan{Tr: tr, Mode: PrefixTransform,
+		OnCommit: func(pre streamxform.Prelude, last bool) bool { atCommit = pre; return pre.ModelSeen },
+		OnFinish: func(pre streamxform.Prelude) { atFinish = pre },
+	})
+	feedAll(s, body, 4096)
+	if !s.raw {
+		t.Fatal("这份请求体应当走到透传阶段")
+	}
+	if !atCommit.ModelSeen {
+		t.Fatal("提交时应当已经看到 model")
+	}
+	if atFinish != atCommit {
+		t.Fatalf("OnFinish 拿到的 prelude 与提交时不一致：%+v vs %+v", atFinish, atCommit)
+	}
+}

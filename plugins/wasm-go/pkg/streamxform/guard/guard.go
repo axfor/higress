@@ -59,6 +59,8 @@ type State struct {
 	dead      bool   // Observe: observation stopped
 	out       []byte // output of the current Feed when the transformer had to build one
 	unchanged bool   // this Feed produced exactly the bytes it was handed: forward them, replace nothing
+	pre       streamxform.Prelude
+	preKept   bool // pre holds the prelude captured when the transformer was dropped
 }
 
 // UnchangedFastPath forwards the caller's own bytes for a chunk the transformer did not change, so the driver
@@ -83,6 +85,15 @@ func New(p *Plan) *State {
 		p.Tr.SetSink(func(b []byte) { s.out = append(s.out, b...) })
 	}
 	return s
+}
+
+// prelude returns the protocol's prelude, from the transformer while it is alive and from the copy kept when
+// it was dropped. Reading it off a dropped transformer would silently yield a zero value.
+func (s *State) prelude() streamxform.Prelude {
+	if s.preKept {
+		return s.pre
+	}
+	return Prelude(s.plan.Tr)
 }
 
 // Prelude returns the Prelude reported by the transformer's protocol (zero value when it does not implement Preluder).
@@ -139,14 +150,14 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 	}
 	if s.plan.Passthrough || s.raw {
 		if !s.sent {
-			if s.plan.OnCommit != nil && !s.plan.OnCommit(Prelude(s.plan.Tr), last) {
+			if s.plan.OnCommit != nil && !s.plan.OnCommit(s.prelude(), last) {
 				return s.toFallback(last, "OnCommit asked for a fallback", "oncommit")
 			}
 			s.sent = true
 			s.metric("streamed")
 		}
 		if last && s.plan.OnFinish != nil {
-			s.plan.OnFinish(Prelude(s.plan.Tr))
+			s.plan.OnFinish(s.prelude())
 		}
 		return chunk, types.ActionContinue
 	}
@@ -228,6 +239,9 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		// Rewrites only happen at the start, so once the prefix is released the rest can be forwarded
 		// verbatim and the transformer dropped -- but only while the engine has no bytes left to give,
 		// which is what the RootDone check above establishes.
+		// The prelude is what the protocol learnt while scanning; keep it, because dropping the transformer
+		// would otherwise hand OnFinish a zero value on the last chunk.
+		s.pre, s.preKept = Prelude(tr), true
 		s.raw = true
 		s.plan.Tr = nil
 	}
