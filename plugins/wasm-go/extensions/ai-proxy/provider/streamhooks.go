@@ -354,7 +354,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 	}
 	defaultPlan := func(v streamxform.OpenAIVariant) *StreamPlan {
-		return &StreamPlan{Tr: streamxform.NewOpenAI(defaultOpts(v)), ApplyStream: detectStream, ApplyModel: true, ContextHandled: isChat}
+		return &StreamPlan{Tr: c.openAIShape(defaultOpts(v)), ApplyStream: detectStream, ApplyModel: true, ContextHandled: isChat}
 	}
 	// among the providers on the default path, these endpoint kinds are handled separately by the buffered path
 	inDefaultApis := true
@@ -462,7 +462,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		opts := defaultOpts(&streamxform.QwenVariant{SupportsPreserveThinking: qwenSupportsPreserveThinking})
 		opts.ModelOnlyIfPresent = true
 		opts.DetectStream = c.firstByteTimeout != 0 // no Accept / isStreaming on this branch; stream is only observed for the first-byte timeout
-		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false, ContextHandled: isChat}, ""
+		return &StreamPlan{Tr: c.openAIShape(opts), ApplyStream: false, ApplyModel: false, ContextHandled: isChat}, ""
 
 	case c.typ == providerTypeMinimax && c.minimaxApiType == minimaxApiTypePro && isChat:
 		// handleRequestBodyByChatCompletionPro: the request is rebuilt (system → bot_setting, user / assistant →
@@ -516,7 +516,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		opts := defaultOpts(nil)
 		opts.DetectStream = c.firstByteTimeout != 0 // neither Accept / isStreaming nor the model context keys on this branch
-		p := &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: false, ApplyModel: false, ContextHandled: true}
+		p := &StreamPlan{Tr: c.openAIShape(opts), ApplyStream: false, ApplyModel: false, ContextHandled: true}
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			// the buffered path only switches to the v2 endpoint in the body phase (not in the header phase); the path is fixed and independent of body fields
 			if err := util.OverwriteRequestPath(c.bodyPhasePath(minimaxChatCompletionV2Path)); err != nil {
@@ -723,7 +723,7 @@ func (c *ProviderConfig) newStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		opts.NormalizeUsage = false
 		opts.CheckMessages = false
 		opts.DeveloperRoleSupported = true
-		p := checkChatRequestTypes(&StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true, ContextHandled: true})
+		p := checkChatRequestTypes(&StreamPlan{Tr: c.openAIShape(opts), ApplyStream: true, ApplyModel: true, NoAcceptHeader: true, RequireModelBeforeCommit: true, ContextHandled: true})
 		p.AfterPrelude = func(ctx wrapper.HttpContext, pre streamxform.Prelude) {
 			ctx.SetContext(contextOpenAICompatibleMarker, true)
 			if err := util.OverwriteRequestPath(vp.getOpenAICompatibleRequestPath()); err != nil {
@@ -1051,6 +1051,26 @@ func (c *ProviderConfig) withClaudeInput(p *StreamPlan, apiName ApiName) (*Strea
 	}
 	p.MergeHandled = true
 	return p, ""
+}
+
+// openAIShape builds the transformer of a plan whose body stays OpenAI-shaped, with the struct round trips the
+// buffered path makes around it: responseJsonSchema decodes the request into chatCompletionRequest and marshals it
+// back before the default transform (the schema itself is written by the protocol), and the context insertion
+// does the same after it. Both stages reproduce json.Marshal's rendering, so the request the upstream sees is
+// the buffered one to the byte where it matters.
+func (c *ProviderConfig) openAIShape(opts streamxform.OpenAIOptions) streamxform.Xform {
+	tr := streamxform.NewOpenAI(opts)
+	if opts.CheckMessages && ChatRequestTypeCheck {
+		tr.SetFieldTree(chatRequestFieldTree)
+	}
+	var x streamxform.Xform = tr
+	if opts.ResponseFormat != nil {
+		x = streamxform.NewPipeline(streamxform.NewStructRoundTrip(chatRequestFieldTree, nil), x)
+	}
+	if opts.InsertSystem != nil {
+		x = streamxform.NewPipeline(x, streamxform.NewStructRoundTrip(chatRequestFieldTree, nil))
+	}
+	return x
 }
 
 // streamResponseFormat is the configured responseJsonSchema as the openai / longcat TransformRequestBody sets it

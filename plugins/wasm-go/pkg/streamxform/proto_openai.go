@@ -227,9 +227,12 @@ func (p *openaiProto) OnStart(t *Transformer, kind ValueKind) Action {
 		}
 		return Enter()
 	case 1: // messages
-		if kind == KindNull && p.opt.InsertSystem != nil {
-			p.msgsSeen = false // decoded as no messages: the context message becomes the only one, written at the end
-			return Skip()
+		if kind == KindNull {
+			if p.opt.InsertSystem != nil {
+				p.msgsSeen = false // decoded as no messages: the context message becomes the only one, written at the end
+				return Skip()
+			}
+			return Pass() // nothing to look at, and the buffered decode takes null as no messages
 		}
 		if kind != KindArray {
 			return Bail("messages is not an array, gjson Array() semantics not reproduced")

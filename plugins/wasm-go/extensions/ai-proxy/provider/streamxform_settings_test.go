@@ -278,6 +278,12 @@ func TestResponseJsonSchemaDifferential(t *testing.T) {
 	}
 	rf := cfg.streamResponseFormat()
 	require.NotNil(t, rf)
+	shape := func() streamxform.Xform {
+		return cfg.openAIShape(streamxform.OpenAIOptions{
+			MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
+			DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeOpenAI), CheckMessages: true, ResponseFormat: rf,
+		})
+	}
 	for _, in := range []string{
 		`{"model":"m1","messages":[{"role":"user","content":"U"}]}`,
 		`{"model":"m1","response_format":{"type":"text"},"messages":[{"role":"user","content":"U"}]}`,
@@ -293,29 +299,48 @@ func TestResponseJsonSchemaDifferential(t *testing.T) {
 	} {
 		off, offOK := official(in)
 		for _, chunk := range []int{1, 7, 4096} {
-			tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{
-				MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
-				DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeOpenAI), CheckMessages: true, ResponseFormat: rf,
-			})
-			tr.SetFieldTree(chatRequestFieldTree)
-			str, ok, why := runStream(tr, in, chunk)
+			str, ok, why := runXform(shape(), in, chunk)
 			if !offOK {
 				require.False(t, ok, "chunk=%d: buffered failed but streaming passed\n  %s", chunk, in)
 				continue
 			}
 			require.True(t, ok, "chunk=%d unexpected fallback: %s\n  %s", chunk, why, in)
 			require.Equal(t, schema["type"], str["response_format"].(map[string]any)["type"], in)
-			require.Empty(t, diffMaps(off, roundTrip(str)), "chunk=%d\n  %s", chunk, in)
+			// the round-trip stage in front reproduces the buffered decode and marshal: identical, not merely equal after one
+			require.Empty(t, diffMaps(off, str), "chunk=%d\n  %s", chunk, in)
+			_ = roundTrip
 		}
 	}
 }
 
-// The one visible effect of the buffered round trip: stream_options.include_usage false is dropped by omitempty and
-// then re-added as true by normalizeOpenAiRequestBody. Streaming keeps the request's false. Pinned as a deviation.
-func TestResponseJsonSchemaIncludeUsageDeviation(t *testing.T) {
+// runXform drives any Xform (a pipeline included) the way runStream drives a transformer.
+func runXform(x streamxform.Xform, in string, chunk int) (map[string]any, bool, string) {
+	var out []byte
+	x.SetSink(func(b []byte) { out = append(out, b...) })
+	for i := 0; i < len(in); i += chunk {
+		j := i + chunk
+		if j > len(in) {
+			j = len(in)
+		}
+		x.Write([]byte(in[i:j]))
+	}
+	out = append(out, x.Finish()...)
+	if bad, why := x.Unsupported(); bad {
+		return nil, false, why
+	}
+	m, err := decodeMap(out)
+	if err != nil {
+		return nil, false, "output is not valid JSON: " + err.Error() + " :: " + string(out)
+	}
+	return m, true, ""
+}
+
+// stream_options.include_usage false is dropped by the buffered round trip's omitempty and then re-added as true
+// by normalizeOpenAiRequestBody; with the round-trip stage in front the streaming path does the same.
+func TestResponseJsonSchemaIncludeUsageRoundTrip(t *testing.T) {
 	schema := map[string]interface{}{"type": "json_object"}
 	cfg := ProviderConfig{typ: providerTypeLongcat, responseJsonSchema: schema, modelMapping: oaiMapping}
-	in := `{"model":"m1","messages":[{"role":"user","content":"U"}],"stream":true,"stream_options":{"include_usage":false}}`
+	in := `{"model":"m1","messages":[{"role":"user","content":"U"}],"stream":true,"stream_options":{"include_usage":false,"x":1},"foo":{"bar":[1,2]}}`
 	req := &chatCompletionRequest{}
 	require.NoError(t, decodeChatCompletionRequest([]byte(in), req))
 	req.ResponseFormat = schema
@@ -323,12 +348,14 @@ func TestResponseJsonSchemaIncludeUsageDeviation(t *testing.T) {
 	off, ok := officialOpenAI(string(b), oaiMapping, true)
 	require.True(t, ok)
 	require.Equal(t, map[string]any{"include_usage": true}, off["stream_options"])
-	tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{
+	x := cfg.openAIShape(streamxform.OpenAIOptions{
 		MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
 		DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeLongcat), CheckMessages: true, ResponseFormat: cfg.streamResponseFormat(),
 	})
-	str, ok, why := runStream(tr, in, 7)
+	str, ok, why := runXform(x, in, 7)
 	require.True(t, ok, why)
-	require.Equal(t, map[string]any{"include_usage": false}, str["stream_options"])
-	require.Equal(t, "json_object", str["response_format"].(map[string]any)["type"])
+	require.Equal(t, map[string]any{"include_usage": true}, str["stream_options"])
+	_, hasFoo := str["foo"]
+	require.False(t, hasFoo, "a field the struct lacks is dropped, as the buffered path drops it")
+	require.Empty(t, diffMaps(off, str))
 }

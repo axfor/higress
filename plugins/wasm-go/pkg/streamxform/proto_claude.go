@@ -812,7 +812,11 @@ func (p *claudeProto) writeAssistantWithTools(t *Transformer, tcs []oaiToolCall)
 		} else {
 			input = make(map[string]interface{})
 		}
-		blk, _ := json.Marshal(claudeToolUse{Type: "tool_use", Id: tc.Id, Name: tc.Function.Name, Input: &input})
+		inputPtr := &input
+		if input == nil && p.opt.ContextPrefix != nil {
+			inputPtr = nil // the claude inserter's round trip drops the null the builder writes for missing arguments
+		}
+		blk, _ := json.Marshal(claudeToolUse{Type: "tool_use", Id: tc.Id, Name: tc.Function.Name, Input: inputPtr})
 		if !first {
 			w.Byte(',')
 		}

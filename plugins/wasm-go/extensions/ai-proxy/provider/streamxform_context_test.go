@@ -44,14 +44,14 @@ func roundTripChat(t *testing.T, m map[string]any) map[string]any {
 	return out
 }
 
-func newContextOpenAI() *streamxform.Transformer {
+// newContextOpenAI is the plan's transformer: the protocol with the insertion, the struct round trip behind it.
+func newContextOpenAI() streamxform.Xform {
 	content := ctxFileContent
-	tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{
+	cfg := ProviderConfig{typ: providerTypeOpenAI}
+	return cfg.openAIShape(streamxform.OpenAIOptions{
 		MapModel: func(m string) string { return getMappedModel(m, oaiMapping) }, DetectStream: true, NormalizeUsage: true,
 		DeveloperRoleSupported: isDeveloperRoleSupported(providerTypeOpenAI), CheckMessages: true, InsertSystem: &content,
 	})
-	tr.SetFieldTree(chatRequestFieldTree)
-	return tr
 }
 
 func contextCases() []string {
@@ -85,7 +85,7 @@ func TestContextOpenAIDifferential(t *testing.T) {
 	for _, in := range contextCases() {
 		off, offOK := officialContextOpenAI(in)
 		for _, chunk := range []int{1, 7, 4096} {
-			str, ok, why := runStream(newContextOpenAI(), in, chunk)
+			str, ok, why := runXform(newContextOpenAI(), in, chunk)
 			if strings.HasPrefix(in, `{"model":"m1","messages":[{"content":"`+big) {
 				// content ahead of role is held until the role decides where the context message goes: bounded
 				require.False(t, ok, "chunk=%d: content before role past the hold bound falls back", chunk)
@@ -97,7 +97,7 @@ func TestContextOpenAIDifferential(t *testing.T) {
 				continue
 			}
 			require.True(t, ok, "chunk=%d unexpected fallback: %s\n  %s", chunk, why, in)
-			require.Empty(t, diffMaps(off, roundTripChat(t, str)), "chunk=%d\n  %s", chunk, in)
+			require.Empty(t, diffMaps(off, str), "chunk=%d (the round-trip stage makes it identical)\n  %s", chunk, in)
 			// the inserted message is exactly the buffered one
 			msgs := str["messages"].([]any)
 			found := 0
@@ -119,7 +119,7 @@ func TestContextOpenAIAllSystemDeviation(t *testing.T) {
 	off, ok := officialContextOpenAI(in)
 	require.True(t, ok)
 	require.Equal(t, ctxFileContent, off["messages"].([]any)[0].(map[string]any)["content"])
-	str, ok, why := runStream(newContextOpenAI(), in, 7)
+	str, ok, why := runXform(newContextOpenAI(), in, 7)
 	require.True(t, ok, why)
 	msgs := str["messages"].([]any)
 	require.Len(t, msgs, 3)
@@ -174,7 +174,7 @@ func TestContextClaudeDifferential(t *testing.T) {
 					continue
 				}
 				require.True(t, ok, "%s claudeCode=%v chunk=%d unexpected fallback: %s", c.name, claudeCode, chunk, why)
-				require.Empty(t, diffMaps(off, roundTripClaude(t, str)), "%s claudeCode=%v chunk=%d", c.name, claudeCode, chunk)
+				require.Empty(t, diffMaps(off, str), "%s claudeCode=%v chunk=%d", c.name, claudeCode, chunk)
 				require.True(t, strings.HasPrefix(str["system"].(string), ctxFileContent), c.name)
 			}
 		}
@@ -193,4 +193,3 @@ func roundTripClaude(t *testing.T, m map[string]any) map[string]any {
 	require.NoError(t, err)
 	return out
 }
-

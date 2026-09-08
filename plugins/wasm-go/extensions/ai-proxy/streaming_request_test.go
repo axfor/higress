@@ -929,7 +929,7 @@ func TestStreamingRequest_ResponseJsonSchema(t *testing.T) {
 		const cfg = `{"provider":{"type":"openai","apiTokens":["t"],"modelMapping":{"claude-3":"gpt-4o","m":"gpt-4o"},"responseJsonSchema":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}}}`
 		big := strings.Repeat("j", 100000)
 		for _, c := range []struct{ name, endpoint, body string }{
-			{"chat", "/v1/chat/completions", `{"model":"m","response_format":{"type":"text"},"messages":[{"role":"user","content":"` + big + `"}],"stream":true}`},
+			{"chat", "/v1/chat/completions", `{"model":"m","response_format":{"type":"text"},"messages":[{"role":"user","content":"` + big + `"}],"stream":true,"stream_options":{"include_usage":false,"x":1},"foo":1}`},
 			{"claude input", "/v1/messages", `{"model":"claude-3","system":"S","max_tokens":10,"messages":[{"role":"user","content":"` + big + `"}]}`},
 		} {
 			func() {
@@ -944,6 +944,11 @@ func TestStreamingRequest_ResponseJsonSchema(t *testing.T) {
 				require.Equal(t, "json_schema", out["response_format"].(map[string]any)["type"], c.name)
 				require.Equal(t, "answer", out["response_format"].(map[string]any)["json_schema"].(map[string]any)["name"], c.name)
 				require.Equal(t, "gpt-4o", out["model"], c.name)
+				if c.name == "chat" { // the buffered round trip: unknown fields dropped, include_usage false becomes true
+					_, hasFoo := out["foo"]
+					require.False(t, hasFoo)
+					require.Equal(t, map[string]any{"include_usage": true}, out["stream_options"])
+				}
 				require.Equal(t, "/v1/chat/completions", requestHeader(host, ":path"), c.name)
 			}()
 		}

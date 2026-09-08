@@ -1,5 +1,9 @@
 github.com/axfor/ason v0.0.0-20260908150305-eae428eada79 h1:5zsOyQSESvEc/KUQgX07aRy0G649amKrRZMXL1Nw6Io=
 github.com/axfor/ason v0.0.0-20260908150305-eae428eada79/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
+github.com/axfor/ason v0.0.0-20260908231508-d45ef5910c9d h1:ftsRTEEZhuzRnlyhr1EF7WZj2iEVGoSNyfKlTc3Jomo=
+github.com/axfor/ason v0.0.0-20260908231508-d45ef5910c9d/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
+github.com/axfor/ason v0.0.0-20260908231807-3a01764f35ad h1:7SVcid+qOQPPH8sD414MBRnZM5jg2bdRR3Iijbg+FZU=
+github.com/axfor/ason v0.0.0-20260908231807-3a01764f35ad/go.mod h1:oveiNYf0qVoesRdVe5XjtwX03+gobBQlb2b80pxDJtQ=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2 h1:NY33OrWCJJ+DFiLc+lsBY4Ywor2Ik61ssk6qkGF8Ypo=
