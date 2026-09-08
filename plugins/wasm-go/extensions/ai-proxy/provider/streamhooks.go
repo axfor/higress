@@ -69,11 +69,26 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		}
 		return &StreamPlan{Passthrough: true}, ""
 	}
-	if c.IsOriginal() {
-		return nil, "original protocol"
-	}
 	if c.firstByteTimeout != 0 {
 		return nil, "firstByteTimeout needs stream before the headers are released, and the field position is not under our control"
+	}
+	if c.typ == providerTypeVertex && apiName == ApiNameVertexRaw {
+		// Checked before IsOriginal on the buffered path too: the raw endpoints are normally used with the original protocol.
+		return c.vertexRawPlan(ctx, prov)
+	}
+	if c.IsOriginal() {
+		// handleRequestBody returns before it touches the body under the original protocol, and so do the providers with
+		// their own OnRequestBody -- except the two that sign the body, which need all of it.
+		if c.typ == providerTypeHunyuan || (c.typ == providerTypeBedrock && len(c.apiTokens) == 0) {
+			return nil, "original protocol with a signature over the body"
+		}
+		if c.typ == providerTypeMinimax && c.minimaxApiType == minimaxApiTypePro {
+			return nil, "minimax Pro rebuilds the body under the original protocol too"
+		}
+		if !c.isSupportedAPI(apiName) {
+			return nil, "apiName not supported"
+		}
+		return &StreamPlan{Passthrough: true}, ""
 	}
 	if len(c.customSettings) > 0 {
 		return nil, "customSettings rewrites the body"
@@ -259,6 +274,10 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 		if !ok {
 			return nil, "unexpected gemini provider instance type"
 		}
+		if apiName == ApiNameGeminiGenerateContent || apiName == ApiNameGeminiStreamGenerateContent {
+			// The buffered TransformRequestBodyHeaders hands these bodies back untouched; host and key are header-phase work.
+			return &StreamPlan{Passthrough: true}, ""
+		}
 		if !isChat {
 			return nil, "gemini streams chat completion only"
 		}
@@ -294,6 +313,15 @@ func (c *ProviderConfig) NewStreamPlan(ctx wrapper.HttpContext, apiName ApiName,
 			}
 		}
 		return p, ""
+
+	case c.typ == providerTypeBedrock && apiName == ApiNameAnthropicMessages && len(c.apiTokens) > 0:
+		// Mantle keeps the Anthropic body: the buffered onAnthropicMessagesRequestBody reads stream for the Accept header
+		// and maps model, nothing else. With API tokens there is no SigV4 over the body; with AK/SK there is, so no plan.
+		// mapModel fails on a missing model where the default mapping would write an empty one: requiring model before
+		// the commit point sends such a body to the buffered path, which fails it the same way.
+		opts := defaultOpts(nil)
+		opts.DetectStream = true
+		return &StreamPlan{Tr: streamxform.NewOpenAI(opts), ApplyStream: true, ApplyModel: true, RequireModelBeforeCommit: true}, ""
 
 	case c.typ == providerTypeAzure:
 		ap, ok := prov.(*azureProvider)
@@ -395,4 +423,35 @@ func (c *ProviderConfig) StreamFinalizeContext(ctx wrapper.HttpContext, apiName 
 	if plan.ApplyStream && !pre.StreamSeen {
 		ctx.SetContext(ctxKeyIsStreaming, false)
 	}
+}
+
+// vertexRawPlan streams the native Vertex REST endpoints, which the buffered path forwards untouched and only
+// authenticates: Express mode puts the API key in the query string, the standard mode needs an OAuth token.
+// The token is fetched asynchronously by the buffered path and cached; until it is cached the request takes
+// that path, so only the first request after a cold start is buffered.
+func (c *ProviderConfig) vertexRawPlan(ctx wrapper.HttpContext, prov Provider) (*StreamPlan, string) {
+	vp, ok := prov.(*vertexProvider)
+	if !ok {
+		return nil, "unexpected vertex provider instance type"
+	}
+	if !c.isSupportedAPI(ApiNameVertexRaw) {
+		return nil, "apiName not supported"
+	}
+	ctx.SetContext(contextVertexRawMarker, true)
+	if vp.isExpressMode() {
+		return &StreamPlan{Passthrough: true, AfterPrelude: func(ctx wrapper.HttpContext) {
+			path, _ := proxywasm.GetHttpRequestHeader(":path")
+			if err := util.OverwriteRequestPath(appendOrReplaceAPIKey(path, vp.getExpressAPIKey(ctx))); err != nil {
+				log.Errorf("vertexProvider: overwrite request path failed: %v", err)
+			}
+			_ = proxywasm.RemoveHttpRequestHeader("Authorization")
+		}}, ""
+	}
+	token, err := vp.getCachedAccessToken(vp.buildTokenKey())
+	if err != nil || token == "" {
+		return nil, "vertex access token not cached yet, the buffered path fetches it"
+	}
+	return &StreamPlan{Passthrough: true, AfterPrelude: func(ctx wrapper.HttpContext) {
+		_ = proxywasm.ReplaceHttpRequestHeader("Authorization", "Bearer "+token)
+	}}, ""
 }

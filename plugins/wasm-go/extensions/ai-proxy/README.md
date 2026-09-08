@@ -39,9 +39,13 @@ description: AI 代理插件配置参考
 - `qwen`（兼容模式与 DashScope 原生模式）、`zhipuai`、`openrouter`、`minimax`（v2 接口）（各自的字段推导按官方逻辑逐条复刻）；
 - `azure`（请求路径依赖 body 里的 model 时，model 须出现在请求体前 64KB 内，否则回落）；
 - 目标为 Gemini 的文生文请求（OpenAI → Gemini 协议转换；请求路径依赖 model 与 stream，二者须出现在前 64KB 内；含 http(s) 图片链接的请求需要抓取图片，仍走全量路径）；
-- `generic`（请求体逐块直接放行）；Claude 原生接口（`/v1/messages`、`/v1/complete`、embeddings）以及上述透传供应商的其他 JSON 接口（images / audio / responses / videos / fine-tuning 等）。multipart 请求仍走全量路径。
+- `generic`（请求体逐块直接放行）；Claude 原生接口（`/v1/messages`、`/v1/complete`、embeddings）以及上述透传供应商的其他 JSON 接口（images / audio / responses / videos / fine-tuning 等）。multipart 请求仍走全量路径；
+- Gemini 原生 `generateContent` / `streamGenerateContent`（全量路径本就不改 body，逐块放行）；
+- `protocol: original` 的所有供应商（全量路径在 original 下不碰 body），例外是对 body 签名的 hunyuan 与 AK/SK 模式的 bedrock，以及在 original 下同样重建 body 的 Pro 接口模式 minimax；
+- bedrock Mantle `/v1/messages`（apiTokens 模式，只做模型映射与 Accept 头；AK/SK 模式要对 body 做 SigV4 签名，仍走全量）；
+- vertex 原生 REST 直通（Express 模式 API key 进 query；标准模式在 OAuth token 已缓存时流式，冷启动后第一个请求由全量路径取 token）。
 
-其余供应商（Vertex、Bedrock、Cohere、Hunyuan、MiniMax Pro、Dify、DeepL、Triton、Kling）以及配置了
+其余供应商（Vertex 的转换接口、Bedrock Converse、Cohere、Hunyuan、MiniMax Pro、Dify、DeepL、Triton、Kling）以及配置了
 `customSettings` / `context` / `contextCleanupCommands` / `mergeConsecutiveMessages` / `retryOnFailure` /
 `firstByteTimeout` / `responseJsonSchema` / `providerBasePath`（qwen、minimax）/ `qwenFileIds`（qwen 原生）的场景，仍走原有的全量缓冲路径，行为不变。
 

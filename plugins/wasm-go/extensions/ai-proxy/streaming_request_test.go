@@ -186,3 +186,93 @@ func truncate(b []byte) string {
 	}
 	return string(b)
 }
+
+var streamingGeminiConfig = json.RawMessage(`{"provider":{"type":"gemini","apiTokens":["g-key"]}}`)
+var streamingOriginalOpenAIConfig = json.RawMessage(`{"provider":{"type":"openai","apiTokens":["t"],"protocol":"original","modelMapping":{"m":"never-applied"}}}`)
+var streamingBedrockMantleConfig = json.RawMessage(`{"provider":{"type":"bedrock","apiTokens":["bk"],"awsRegion":"us-east-1","modelMapping":{"m":"anthropic.claude-3"}}}`)
+var streamingVertexExpressConfig = json.RawMessage(`{"provider":{"type":"vertex","apiTokens":["vk"],"protocol":"original"}}`)
+
+// The native Gemini endpoints are forwarded untouched by the buffered path; streaming forwards every chunk as it comes.
+func TestStreamingRequest_GeminiNativePassthrough(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingGeminiConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1beta/models/gemini-2.0-flash:generateContent"))
+
+		body := `{"contents":[{"role":"user","parts":[{"text":"` + strings.Repeat("g", 100000) + `"}]}],"generationConfig":{"temperature":0.2}}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		for _, a := range actions {
+			require.Equal(t, types.ActionContinue, a, "native gemini should release every chunk directly")
+		}
+		require.Equal(t, body, string(upstream))
+		require.Equal(t, "generativelanguage.googleapis.com", requestHeader(host, ":authority"))
+		require.Equal(t, "g-key", requestHeader(host, "x-goog-api-key"))
+		require.Equal(t, "/v1beta/models/gemini-2.0-flash:generateContent", requestHeader(host, ":path"))
+	})
+}
+
+// Under the original protocol handleRequestBody returns before touching the body: the streaming path is a passthrough.
+func TestStreamingRequest_OriginalProtocolPassthrough(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingOriginalOpenAIConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/chat/completions"))
+
+		body := `{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("o", 100000) + `"}],"stream":true}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		for _, a := range actions {
+			require.Equal(t, types.ActionContinue, a, "original protocol should release every chunk directly")
+		}
+		require.Equal(t, body, string(upstream), "no model mapping under the original protocol")
+		require.Equal(t, "api.openai.com", requestHeader(host, ":authority"))
+		require.Equal(t, "Bearer t", requestHeader(host, "Authorization"))
+	})
+}
+
+// Bedrock Mantle keeps the Anthropic body: with API tokens the buffered path only maps model and sets Accept from stream.
+func TestStreamingRequest_BedrockMantleMessages(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingBedrockMantleConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		host.CallOnHttpRequestHeaders(streamingRequestHeaders("/v1/messages"))
+
+		body := `{"model":"m","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"` + strings.Repeat("b", 100000) + `"}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		require.Equal(t, types.ActionPause, actions[0], "held until the commit point")
+		require.Equal(t, types.ActionContinue, actions[len(actions)-1])
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(upstream, &out))
+		require.Equal(t, "anthropic.claude-3", out["model"])
+		require.Equal(t, float64(64), out["max_tokens"])
+		require.Len(t, out["messages"].([]any), 1)
+		require.Equal(t, "bedrock-mantle.us-east-1.api.aws", requestHeader(host, ":authority"))
+		require.Equal(t, "/anthropic/v1/messages", requestHeader(host, ":path"))
+		require.Equal(t, "bk", requestHeader(host, "x-api-key"))
+		require.Equal(t, "text/event-stream", requestHeader(host, "Accept"))
+	})
+}
+
+// Vertex raw endpoints in Express mode: body untouched, the API key goes into the query string, the Authorization header goes away.
+func TestStreamingRequest_VertexRawExpress(t *testing.T) {
+	wasmtest.RunTest(t, func(t *testing.T) {
+		host, status := wasmtest.NewTestHost(streamingVertexExpressConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		hdrs := streamingRequestHeaders("/v1/publishers/google/models/gemini-2.0-flash:generateContent")
+		hdrs = append(hdrs, [2]string{"Authorization", "Bearer client-token"})
+		host.CallOnHttpRequestHeaders(hdrs)
+
+		body := `{"contents":[{"role":"user","parts":[{"text":"` + strings.Repeat("v", 100000) + `"}]}]}`
+		actions, upstream := feedChunks(host, []byte(body), 4096)
+		for _, a := range actions {
+			require.Equal(t, types.ActionContinue, a, "vertex raw should release every chunk directly")
+		}
+		require.Equal(t, body, string(upstream))
+		require.Equal(t, "aiplatform.googleapis.com", requestHeader(host, ":authority"))
+		require.Equal(t, "/v1/publishers/google/models/gemini-2.0-flash:generateContent?key=vk", requestHeader(host, ":path"))
+		require.Equal(t, "", requestHeader(host, "Authorization"))
+	})
+}

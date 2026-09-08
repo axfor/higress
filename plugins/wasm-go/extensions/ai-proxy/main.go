@@ -707,6 +707,9 @@ func (x *xformState) feed(chunk []byte, last bool) ([]byte, types.Action) {
 func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
 	if x.plan.Passthrough {
 		// the buffered path does not touch the body: before the first chunk write back the original header info from the context (what its defer does)
+		if x.plan.AfterPrelude != nil {
+			x.plan.AfterPrelude(x.ctx) // header work the buffered path does in the body phase without reading the body (Vertex raw auth)
+		}
 		saveContextsToHeaders(x.ctx)
 		return true
 	}
