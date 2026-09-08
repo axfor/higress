@@ -15,7 +15,7 @@ require (
 )
 
 require (
-	github.com/axfor/ason v0.0.0-20260908130637-d9c82f185274 // indirect
+	github.com/axfor/ason v0.0.0-20260908150305-eae428eada79 // indirect
 	github.com/tetratelabs/wazero v1.7.2 // indirect
 )
 

@@ -379,3 +379,85 @@ func TestEarlyCommitReleasesOnceModelSeen(t *testing.T) {
 		t.Fatalf("参照本身不对：%d vs %d", len(got), len(want))
 	}
 }
+
+// prefixRun feeds body through a PrefixTransform state at the given cuts and returns what went upstream.
+func prefixRun(t *testing.T, body []byte, splits []int, eosSeparate bool, early bool) string {
+	t.Helper()
+	stubHost(t, body)
+	tr := streamxform.NewOpenAI(streamxform.OpenAIOptions{MapModel: func(m string) string {
+		if i := strings.Index(m, "/"); i >= 0 {
+			return m[i+1:]
+		}
+		return m
+	}})
+	p := &Plan{Tr: tr, Mode: PrefixTransform,
+		OnCommit: func(pre streamxform.Prelude, last bool) bool { return pre.ModelSeen }}
+	if early {
+		p.EarlyCommit = func(pre streamxform.Prelude) bool { return pre.ModelSeen }
+	}
+	s := New(p)
+	var out []byte
+	prev := 0
+	for i, cut := range splits {
+		last := !eosSeparate && i == len(splits)-1
+		o, _ := s.Feed(body[prev:cut], last)
+		out = append(out, o...)
+		prev = cut
+	}
+	if eosSeparate {
+		o, _ := s.Feed(nil, true)
+		out = append(out, o...)
+	}
+	return string(out)
+}
+
+// The engine may still hold bytes it has consumed but not written when a chunk ends -- a key it is reading,
+// a comma waiting for the next key. Dropping the transformer at that moment and forwarding the next chunk
+// verbatim loses them. With early commit the release lands right after the model value, where exactly those
+// bytes are pending, so every split of a body with fields after model has to come out complete.
+func TestPrefixTransformEarlyCommitIsCompleteUnderAnySplit(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"` + big(3000) + `"}] , "model" : "p/m1" , "stream":true,"max_tokens":16}` + "\n")
+	want := strings.Replace(string(body), `"model" : "p/m1"`, `"model" : "m1"`, 1)
+	// every two-piece split
+	for cut := 1; cut < len(body); cut++ {
+		for _, sep := range []bool{true, false} {
+			if got := prefixRun(t, body, []int{cut, len(body)}, sep, true); got != want {
+				t.Fatalf("cut=%d eos单独=%v: %q", cut, sep, tailOf(got))
+			}
+		}
+	}
+	// fixed small chunks, the shape the model-router test uses
+	for _, n := range []int{1, 3, 5, 7, 11, 64} {
+		var splits []int
+		for i := n; i < len(body); i += n {
+			splits = append(splits, i)
+		}
+		splits = append(splits, len(body))
+		if got := prefixRun(t, body, splits, false, true); got != want {
+			t.Fatalf("chunk=%d: %q", n, tailOf(got))
+		}
+	}
+}
+
+// The same hazard exists without early commit: the chunk that crosses the window can end while the engine
+// holds bytes at the root level, when fields follow the large one. Every split around and after the window
+// must come out complete.
+func TestPrefixTransformWindowCommitIsCompleteWhenFieldsFollowTheWindow(t *testing.T) {
+	body := []byte(`{"model":"p/m1","messages":[{"role":"user","content":"` + big(66000) + `"}] , "stream" : true , "max_tokens":16,"user":"u"}` + "\n")
+	want := strings.Replace(string(body), `"model":"p/m1"`, `"model":"m1"`, 1)
+	for cut := 64<<10 - 64; cut < len(body); cut++ {
+		for _, sep := range []bool{true, false} {
+			if got := prefixRun(t, body, []int{cut, len(body)}, sep, false); got != want {
+				t.Fatalf("cut=%d eos单独=%v: %q", cut, sep, tailOf(got))
+			}
+		}
+	}
+	// three pieces: the second cut anywhere in the trailing fields
+	for a := 64<<10 - 32; a < 64<<10+32; a++ {
+		for b := a + 1; b < len(body); b += 3 {
+			if got := prefixRun(t, body, []int{a, b, len(body)}, false, false); got != want {
+				t.Fatalf("cuts=%d,%d: %q", a, b, tailOf(got))
+			}
+		}
+	}
+}

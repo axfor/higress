@@ -11,6 +11,7 @@
 | `enableOnPathSuffix` | array of string | 选填                    | ["/completions","/embeddings","/images/generations","/audio/speech","/fine_tuning/jobs","/moderations","/image-synthesis","/video-synthesis","/rerank","/messages"] | 只对这些特定路径后缀的请求生效，可以配置为 "*" 以匹配所有路径 |
 | `keepOriginalModelName` | bool         | 选填                    | false                    | 配合 `addProviderHeader` 使用，设为 true 时仍提取 provider 写入 header，但不改写请求体中的 model 字段 |
 | `autoRouting`        | object          | 选填                    | -                        | 自动路由配置，详见下方说明                            |
+| `streamEarlyCommit`  | bool            | 选填                    | false                    | 请求体流式处理时，一旦读到 `model` 就开始向上游转发，不再等满 64KB 窗口；每个在途请求持有的字节更少，但放弃"窗口内的请求体与全量路径行为完全一致"的保证（窗口内出现的 JSON 语法错误不再回落）。详见下方"请求体流式处理" |
 
 ### autoRouting 配置
 
@@ -36,6 +37,10 @@ JSON 请求体且 `modelKey` 是顶层普通字段时，插件不再缓冲整份
 以下情形自动走原来的全量缓冲路径，结果与之前完全一致：`multipart/form-data`、`modelKey` 是 gjson 路径（含 `.` 等）、
 自动路由（需要读最后一条 user 消息）、`model` 不是字符串、窗口内没有出现 `model`（如 SDK 把很长的 `messages` 放在 `model` 之前）、
 窗口内出现 JSON 语法错误。
+
+`streamEarlyCommit: true` 时不等窗口读满：`model` 一到就设置路由头并开始转发，64KB 只做上限。转换器改写完 `model`
+之后，要等引擎把已读入的字节全部写出（例如正在读的下一个 key、等着逗号的空白）才会被丢掉，之后的字节原样转发；
+这一点在窗口模式下同样成立。
 
 指标：`model_router.stream.streamed` / `fallback`（Envoy 统计前缀 `wasmcustom.`）。
 

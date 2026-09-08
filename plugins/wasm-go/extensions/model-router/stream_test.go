@@ -177,3 +177,49 @@ func TestStream_NestedModelKeyUsesOfficialPath(t *testing.T) {
 		require.Equal(t, "m1", header(host, "x-model"))
 	})
 }
+
+var earlyCommitConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"modelKey":           "model",
+		"addProviderHeader":  "x-provider",
+		"modelToHeader":      "x-model",
+		"enableOnPathSuffix": []string{"/v1/chat/completions"},
+		"streamEarlyCommit":  true,
+	})
+	return data
+}()
+
+// With streamEarlyCommit the first chunk carrying model is released at once instead of waiting for the window.
+func TestStream_EarlyCommit_ModelFirstBigBody(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(earlyCommitConfig)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		require.Equal(t, types.HeaderStopIteration, host.CallOnHttpRequestHeaders(streamHeaders("application/json")))
+		body := []byte(`{"model" : "openai/gpt-4o" ,"messages":[{"role":"user","content":"` + bigContent(300<<10) + `"}]}` + "\n")
+		acts, up := feedStream(host, body, 4096)
+		require.Equal(t, types.ActionContinue, acts[0], "the first chunk carries model: released at once")
+		want, _ := sjson.SetBytes(body, "model", "gpt-4o")
+		require.Equal(t, string(want), string(up))
+		require.Equal(t, "openai", header(host, "x-provider"))
+		require.Equal(t, "openai/gpt-4o", header(host, "x-model"))
+	})
+}
+
+// Early commit releases right after the model value, where the engine still holds the comma and the start
+// of the next key; the body has to reach the upstream complete under small chunks.
+func TestStream_EarlyCommit_SdkOrderSmallBody(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		for _, chunk := range []int{1, 5, 7, 64} {
+			host, status := test.NewTestHost(earlyCommitConfig)
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+			require.Equal(t, types.HeaderStopIteration, host.CallOnHttpRequestHeaders(streamHeaders("application/json")))
+			body := []byte(`{"messages":[{"role":"user","content":"hi"}],"model":"openai/gpt-4o","stream":true}`)
+			_, up := feedStream(host, body, chunk)
+			want, _ := sjson.SetBytes(body, "model", "gpt-4o")
+			require.Equal(t, string(want), string(up), "chunk=%d", chunk)
+			require.Equal(t, "openai", header(host, "x-provider"))
+			host.Reset()
+		}
+	})
+}

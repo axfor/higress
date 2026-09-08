@@ -55,17 +55,21 @@ func newStream(ctx wrapper.HttpContext, config ModelRouterConfig) *guard.State {
 		ModelKey: config.modelKey,
 		OnKey:    r.onModel,
 	})
-	return guard.New(&guard.Plan{
+	p := &guard.Plan{
 		Tr:       tr,
 		Mode:     guard.PrefixTransform,
 		OnCommit: r.commit,
+		Fallback: func(body []byte) types.Action { return onHttpRequestBody(ctx, config, body) },
+		Metric:   streamMetric,
+		Log:      log.Warnf,
+	}
+	if config.streamEarlyCommit {
 		// The only field the headers depend on is model; once it has been seen and the request is not one
-		// the buffered path has to handle whole, holding a window's worth of bytes buys nothing.
-		EarlyCommit: func(streamxform.Prelude) bool { return r.modelOK && !r.needFull },
-		Fallback:    func(body []byte) types.Action { return onHttpRequestBody(ctx, config, body) },
-		Metric:      streamMetric,
-		Log:         log.Warnf,
-	})
+		// the buffered path has to handle whole, holding a window's worth of bytes buys nothing. Off by
+		// default because it gives up "a body within the window behaves exactly like the buffered path".
+		p.EarlyCommit = func(streamxform.Prelude) bool { return r.modelOK && !r.needFull }
+	}
+	return guard.New(p)
 }
 
 // onModel: the model value is complete. Decides whether to rewrite in place (strip the provider/ prefix).

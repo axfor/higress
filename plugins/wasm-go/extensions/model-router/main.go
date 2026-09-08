@@ -49,6 +49,7 @@ type ModelRouterConfig struct {
 	modelToHeader         string
 	enableOnPathSuffix    []string
 	keepOriginalModelName bool
+	streamEarlyCommit     bool
 	// Auto routing configuration
 	enableAutoRouting bool
 	autoRoutingRules  []AutoRoutingRule
@@ -63,6 +64,7 @@ func parseConfig(json gjson.Result, config *ModelRouterConfig) error {
 	config.addProviderHeader = json.Get("addProviderHeader").String()
 	config.modelToHeader = json.Get("modelToHeader").String()
 	config.keepOriginalModelName = json.Get("keepOriginalModelName").Bool()
+	config.streamEarlyCommit = json.Get("streamEarlyCommit").Bool()
 
 	enableOnPathSuffix := json.Get("enableOnPathSuffix")
 	if enableOnPathSuffix.Exists() && enableOnPathSuffix.IsArray() {

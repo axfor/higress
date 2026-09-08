@@ -236,15 +236,21 @@ func (s *State) Feed(chunk []byte, last bool) ([]byte, types.Action) {
 		// and any trailing whitespace for Finish, so the transformer has to stay until the end of the stream.
 		// Counted because this branch is easy to get wrong and its failure mode is a silently truncated body.
 		s.metric("prefix_kept_for_finish")
-	} else if s.plan.Mode == PrefixTransform {
+	} else if s.plan.Mode == PrefixTransform && tr.Aligned() {
 		// Rewrites only happen at the start, so once the prefix is released the rest can be forwarded
-		// verbatim and the transformer dropped -- but only while the engine has no bytes left to give,
-		// which is what the RootDone check above establishes.
+		// verbatim and the transformer dropped -- but only while the engine holds nothing it has consumed
+		// and not written yet, which is what Aligned establishes (and RootDone above for the closing token).
 		// The prelude is what the protocol learnt while scanning; keep it, because dropping the transformer
 		// would otherwise hand OnFinish a zero value on the last chunk.
 		s.pre, s.preKept = Prelude(tr), true
 		s.raw = true
 		s.plan.Tr = nil
+	} else if s.plan.Mode == PrefixTransform {
+		// The engine still holds bytes: a key it is in the middle of reading, whitespace waiting for its
+		// comma, a comma waiting for the next key. Forwarding the next chunk verbatim would drop them, so the
+		// transformer stays and the question is asked again after the next chunk; inside a large
+		// pass-through value the answer is yes. Counted for the same reason as prefix_kept_for_finish.
+		s.metric("prefix_kept_unaligned")
 	}
 	return out, types.ActionContinue
 }
