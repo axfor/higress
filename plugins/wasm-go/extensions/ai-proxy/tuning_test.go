@@ -7,6 +7,7 @@ import (
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
 
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
 )
 
@@ -79,5 +80,28 @@ func TestApplyStreamTuningKeepsPreviousOnBadValue(t *testing.T) {
 	}
 	if wrapper.GCWatchdogFloor != 32<<20 {
 		t.Errorf("越界值不该覆盖先前的下限，得到 %d", wrapper.GCWatchdogFloor)
+	}
+}
+
+// 类型校验的开关是为灰度准备的：它会让网关变严格，一个字段类型写错的请求从"转发给供应商"
+// 变成"网关直接 500"。虽然那本来就是缓冲路径一直以来的行为，但对已经依赖当前宽松行为的调用方
+// 是可感知的变化，所以必须能在不回滚构建的前提下关掉。
+func TestStreamTypeCheckSwitch(t *testing.T) {
+	log.SetPluginLog(quietLog{})
+	t.Cleanup(func() { streamTypeCheck = true; provider.ChatRequestTypeCheck = true })
+
+	applyStreamTuning(gjson.Parse(`{"streamTypeCheck":false}`))
+	if streamTypeCheck || provider.ChatRequestTypeCheck {
+		t.Fatal("关不掉")
+	}
+	applyStreamTuning(gjson.Parse(`{"streamTypeCheck":true}`))
+	if !streamTypeCheck || !provider.ChatRequestTypeCheck {
+		t.Fatal("开不回来")
+	}
+	// 没写这个字段时不该改变现状
+	provider.ChatRequestTypeCheck = false
+	applyStreamTuning(gjson.Parse(`{"streamCommitWindowBytes":16384}`))
+	if provider.ChatRequestTypeCheck {
+		t.Fatal("没写这个字段却被改动了")
 	}
 }

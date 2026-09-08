@@ -396,6 +396,14 @@ const ctxKeyXformState = "aip_xform_state"
 // (wrapper.GCWatchdogFloor).
 var streamCommitWindowBytes int
 
+// streamTypeCheck turns off the root-field type checking that reproduces the buffered path's rejection surface.
+//
+// It exists for rollout, not for tuning. The check makes the gateway stricter: a request with a wrongly typed
+// field used to be forwarded to the provider and now fails at the gateway, which is what the buffered path has
+// always done but is a visible change for anyone who had come to rely on the looser behaviour. A deployment
+// that needs to roll it back can, without going back to an older build.
+var streamTypeCheck = true
+
 // applyStreamTuning reads the two knobs. Out-of-range values are logged and ignored rather than clamped: a
 // wrong number in a config should be visible, not silently turned into a different one.
 func applyStreamTuning(json gjson.Result) {
@@ -410,6 +418,10 @@ func applyStreamTuning(json gjson.Result) {
 			streamCommitWindowBytes = n
 		}
 	}
+	if v := json.Get("streamTypeCheck"); v.Exists() {
+		streamTypeCheck = v.Bool()
+		provider.ChatRequestTypeCheck = streamTypeCheck
+	}
 	if v := json.Get("streamGcFloorBytes"); v.Exists() {
 		n := v.Int()
 		switch {
@@ -421,7 +433,8 @@ func applyStreamTuning(json gjson.Result) {
 			wrapper.GCWatchdogFloor = uint64(n)
 		}
 	}
-	log.Infof("streaming tuning: commit window %d bytes, gc floor %d bytes", effectiveCommitWindow(), wrapper.GCWatchdogFloor)
+	log.Infof("streaming tuning: commit window %d bytes, gc floor %d bytes, root field type check %v",
+		effectiveCommitWindow(), wrapper.GCWatchdogFloor, streamTypeCheck)
 }
 
 func effectiveCommitWindow() int {

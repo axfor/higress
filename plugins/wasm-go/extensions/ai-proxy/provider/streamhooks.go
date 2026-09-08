@@ -347,11 +347,15 @@ var chatRequestFieldTypes = streamxform.FieldTypesOf(&chatCompletionRequest{})
 // which reads the body with gjson and type-checks nothing; adding the check there would make the streaming
 // path stricter than the buffered one, which is a deviation in the other direction.
 func checkChatRequestTypes(p *StreamPlan) *StreamPlan {
-	if p != nil && p.Tr != nil {
+	if p != nil && p.Tr != nil && ChatRequestTypeCheck {
 		p.Tr.SetFieldTypes(chatRequestFieldTypes)
 	}
 	return p
 }
+
+// ChatRequestTypeCheck turns the check off for a rollout that needs the previous, looser behaviour back.
+// See streamTypeCheck in main.go for why it exists.
+var ChatRequestTypeCheck = true
 
 // StreamApplyPrelude applies the side effects of the buffered path:
 //   - request header Accept: text/event-stream (only when stream is true; only effective while the headers are still held)
