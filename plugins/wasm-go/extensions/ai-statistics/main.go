@@ -37,6 +37,7 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessStreamingRequestBodyWithAction(onHttpStreamingRequestBody),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingBody),
 		wrapper.ProcessResponseBody(onHttpResponseBody),
@@ -668,6 +669,8 @@ func parseConfig(configJson gjson.Result, config *AIStatisticsConfig) error {
 	return nil
 }
 
+var geminiModelPathRe = regexp.MustCompile(`^.*/(?P<api_version>[^/]+)/models/(?P<model>[^:]+):\w+Content$`)
+
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config AIStatisticsConfig) types.Action {
 	// Check if request path matches enabled suffixes
 	requestPath, _ := proxywasm.GetHttpRequestHeader(":path")
@@ -701,6 +704,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AIStatisticsConfig) ty
 	// Always buffer request body to extract model field
 	// This is essential for metrics and logging
 	ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
+	if !requestStreamable(config) {
+		ctx.BufferRequestBody() // attributes are extracted from the request body: buffered path (see observer.go)
+	}
 
 	// Extract session ID from headers
 	sessionId := extractSessionId(config.sessionIdHeader)
@@ -737,20 +743,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body 
 			requestModel = model.String()
 		}
 	}
-	// If model not found in body, try to extract from path (Gemini style)
-	if requestModel == "UNKNOWN" {
-		requestPath := ctx.GetStringContext(RequestPath, "")
-		if strings.Contains(requestPath, "generateContent") || strings.Contains(requestPath, "streamGenerateContent") { // Google Gemini GenerateContent
-			reg := regexp.MustCompile(`^.*/(?P<api_version>[^/]+)/models/(?P<model>[^:]+):\w+Content$`)
-			matches := reg.FindStringSubmatch(requestPath)
-			if len(matches) == 3 {
-				requestModel = matches[2]
-			}
-		}
-	}
-	ctx.SetContext(tokenusage.CtxKeyRequestModel, requestModel)
-	setSpanAttribute(ArmsRequestModel, requestModel)
-
 	// Set the number of conversation rounds (only if body is available)
 	userPromptCount := 0
 	if len(body) > 0 {
@@ -770,11 +762,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body 
 			}
 		}
 	}
-	ctx.SetUserAttribute(ChatRound, userPromptCount)
-
-	// Write log
-	debugLogAiLog(ctx)
-	_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
+	finishRequestBody(ctx, requestModel, userPromptCount)
 	return types.ActionContinue
 }
 
@@ -1470,10 +1458,10 @@ func setSpanAttribute(key string, value interface{}) {
 
 // isErrorResponse checks whether the LLM response indicates an error.
 // Detects errors by:
-// 1. Response body contains non-null "error" field at root level (OpenAI/Anthropic format).
-//    Handles both raw JSON and SSE "data: " prefixed chunks, including multi-event
-//    streaming buffers.
-// 2. HTTP status code >= 400 as fallback when body is empty.
+//  1. Response body contains non-null "error" field at root level (OpenAI/Anthropic format).
+//     Handles both raw JSON and SSE "data: " prefixed chunks, including multi-event
+//     streaming buffers.
+//  2. HTTP status code >= 400 as fallback when body is empty.
 //
 // Note: some providers (e.g. Anthropic streaming responses) emit {"error":""}
 // even on success; an empty-string error is treated as not-an-error to avoid

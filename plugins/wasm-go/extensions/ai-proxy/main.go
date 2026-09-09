@@ -10,10 +10,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/config"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform/guard"
 
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
@@ -111,10 +114,11 @@ func init() {
 		pluginName,
 		wrapper.ParseOverrideConfig(parseGlobalConfig, parseOverrideRuleConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeader),
-		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessStreamingRequestBodyWithAction(onHttpStreamingRequestBody),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
 		wrapper.ProcessResponseBody(onHttpResponseBody),
+		wrapper.ProcessStreamDone(onStreamDone),
 		wrapper.WithRebuildMaxMemBytes[config.PluginConfig](200*1024*1024),
 	)
 }
@@ -131,6 +135,7 @@ func parseGlobalConfig(json gjson.Result, pluginConfig *config.PluginConfig) err
 		log.Errorf("failed to apply global rule config: %v", err)
 		return err
 	}
+	applyStreamTuning(json)
 
 	return nil
 }
@@ -313,6 +318,13 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 		}
 
 		if hasRequestBody && hasRequestBodyHandler {
+			// Keep the declared size before dropping the header: admission needs it to tell whether diverting
+			// a request to the buffered path would cost more memory than admitting it.
+			if v, err := proxywasm.GetHttpRequestHeader(headerContentLength); err == nil {
+				if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+					ctx.SetContext(ctxKeyDeclaredBodyBytes, n)
+				}
+			}
 			_ = proxywasm.RemoveHttpRequestHeader(headerContentLength)
 			ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
 			// Delay the header processing to allow changing in OnRequestBody
@@ -357,6 +369,414 @@ func contentLengthExceedsLimit(contentLength string, limit uint32) bool {
 		return false
 	}
 	return length > uint64(limit)
+}
+
+// onHttpStreamingRequestBody handles the request body chunk by chunk (layer 3: Guard).
+//
+// The request headers are held in the header phase (HeaderStopIteration) until this function first returns ActionContinue.
+// So before the commit point it always returns ActionPause: the raw bytes stay in the Envoy buffer (on the order of CommitBytes)
+// and the transformer's output is kept as well. A bail inside that window switches to the buffered path, a clean fallback;
+// a bail after the commit point cannot take back the bytes already sent upstream, so the request can only fail.
+//
+// Facts that affect the request headers (stream / model) are applied before release; those that appear later can only become context keys.
+func onHttpStreamingRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, chunk []byte, isLastChunk bool) ([]byte, types.Action) {
+	st, _ := ctx.GetContext(ctxKeyXformState).(*xformState)
+	if st == nil {
+		st = newXformState(ctx, pluginConfig)
+		ctx.SetContext(ctxKeyXformState, st)
+	}
+	return st.feed(chunk, isLastChunk)
+}
+
+const ctxKeyXformState = "aip_xform_state"
+
+// Tuning knobs for the streaming path, read from the plugin config.
+//
+// Both are operational levers with measured effect and no behavioural consequence, so they are configuration
+// rather than constants. The commit window bounds what one in-flight request holds before anything is
+// released: 64KB down to 16KB cuts that to a quarter, at the cost of falling back more often, because a shape
+// the transform cannot handle has to be found inside the window to be recoverable. The GC floor is the heap
+// size below which the watchdog never forces a collection: 64MB down to 32MB halves the fixed floor each wasm
+// VM sits at, at the cost of collecting more often.
+//
+// Zero means "leave the default": 64KB for the window (streamxform.CommitBytes), 64MB for the floor
+// (wrapper.GCWatchdogFloor).
+var streamCommitWindowBytes int
+
+// streamTypeCheck turns off the root-field type checking that reproduces the buffered path's rejection surface.
+//
+// It exists for rollout, not for tuning. The check makes the gateway stricter: a request with a wrongly typed
+// field used to be forwarded to the provider and now fails at the gateway, which is what the buffered path has
+// always done but is a visible change for anyone who had come to rely on the looser behaviour. A deployment
+// that needs to roll it back can, without going back to an older build.
+var streamTypeCheck = true
+
+// streamEarlyCommit commits as soon as a request's headers no longer depend on anything still to come,
+// instead of holding a full commit window first.
+//
+// The window keeps a retreat open -- until it fills, a shape the transform cannot handle can still fall back
+// to the buffered path. Measured on this gateway, legitimate traffic never takes that retreat (1.2 million
+// requests in a soak, zero fallbacks): the fallback triggers are all malformed input, which fails on either
+// path. What the window costs is real, though: every in-flight stream holds up to 64KB, which at 800
+// concurrent 70KB requests is the whole difference between the streaming and buffered paths' memory. With
+// this on, a request commits once model (and stream, where a header or path depends on it) has been seen --
+// the first chunk for every SDK we know of -- and the window bounds only requests where that never happens.
+//
+// Off by default for rollout: it withdraws the guarantee that a body no larger than the window behaves
+// exactly like the buffered path, and a deployment should turn that in with its eyes open.
+var streamEarlyCommit = false
+
+// applyStreamTuning reads the two knobs. Out-of-range values are logged and ignored rather than clamped: a
+// wrong number in a config should be visible, not silently turned into a different one.
+func applyStreamTuning(json gjson.Result) {
+	if v := json.Get("streamCommitWindowBytes"); v.Exists() {
+		n := int(v.Int())
+		switch {
+		case n == 0:
+			streamCommitWindowBytes = 0
+		case n < 4<<10 || n > 1<<20:
+			log.Errorf("streamCommitWindowBytes %d out of range [4096, 1048576], keeping %d", n, effectiveCommitWindow())
+		default:
+			streamCommitWindowBytes = n
+		}
+	}
+	if v := json.Get("streamInflightBudgetBytes"); v.Exists() {
+		n := int(v.Int())
+		switch {
+		case n == 0:
+			admBudgetBytes = 32 << 20
+		case n < 1<<20 || n > 1<<30:
+			log.Errorf("streamInflightBudgetBytes %d out of range [1048576, 1073741824], keeping %d", n, admBudgetBytes)
+		default:
+			admBudgetBytes = n
+		}
+	}
+	if v := json.Get("streamEarlyCommit"); v.Exists() {
+		streamEarlyCommit = v.Bool()
+	}
+	if v := json.Get("streamTypeCheck"); v.Exists() {
+		streamTypeCheck = v.Bool()
+		provider.ChatRequestTypeCheck = streamTypeCheck
+	}
+	if v := json.Get("streamGcFloorBytes"); v.Exists() {
+		n := v.Int()
+		switch {
+		case n == 0:
+			wrapper.GCWatchdogFloor = 64 << 20
+		case n < 8<<20 || n > 512<<20:
+			log.Errorf("streamGcFloorBytes %d out of range [8388608, 536870912], keeping %d", n, wrapper.GCWatchdogFloor)
+		default:
+			wrapper.GCWatchdogFloor = uint64(n)
+		}
+	}
+	log.Infof("streaming tuning: commit window %d bytes, in-flight budget %d bytes (limit %.0f uploads), gc floor %d bytes, root field type check %v, early commit %v",
+		effectiveCommitWindow(), admBudgetBytes, admLimit(), wrapper.GCWatchdogFloor, streamTypeCheck, streamEarlyCommit)
+}
+
+func effectiveCommitWindow() int {
+	if streamCommitWindowBytes > 0 {
+		return streamCommitWindowBytes
+	}
+	return streamxform.CommitBytes
+}
+
+// Admission control for the streaming path.
+//
+// Buffering the whole body has a side effect the streaming path loses: it caps how many requests are being
+// uploaded to the upstream at the same time. Without that cap, thousands of concurrent uploads starve each
+// other and throughput collapses (measured: the same collapse happens with no wasm filter at all, so it is a
+// property of the data path, not of this plugin). Streaming therefore has to state the bound itself: past the
+// current limit, new requests take the buffered path, which is exactly how the plugin behaved before.
+//
+// The bound is stated in bytes, not in requests, because bytes are what it is protecting. What one in-flight
+// upload holds is one commit window, so a limit expressed as a request count silently means something different
+// as soon as the window changes: 500 uploads is 32MB at the 64KB default and half a gigabyte at a 1MB window.
+// The number of admitted uploads is therefore derived, and the two knobs cannot contradict each other:
+//
+//	limit = admBudgetBytes / commit window
+//
+// At the defaults that is 32MB / 64KB = 512, which is where the previously hand-picked 500 came from -- it is
+// the same bound, now with a reason. Raising the window to 256KB lowers the limit to 128 on its own.
+//
+// An adaptive version is kept behind admAdaptive: every completed streaming request reports how long it took,
+// the shortest time ever seen (with slow decay, so the baseline follows the upstream) is the reference, and the
+// limit grows additively while requests finish quickly and is cut multiplicatively once they queue. It is off
+// by default: on the lab gateway it walked the limit up to admMax, and 1MB bodies at 400 concurrency then
+// showed a 1.6x larger Envoy heap (315-370MB of tcmalloc against 199-204MB) and a p99 of 37-42s against 15-18s,
+// with no throughput to show for it. Turn it on only with that heap and tail latency under watch.
+const (
+	admLatencyOK  = 2  // finished within baseline x2: there is headroom, raise the limit by one
+	admLatencyBad = 4  // took longer than baseline x4: requests are queueing, cut the limit to 0.9x
+	admDecayEvery = 64 // every this many completions, relax the baseline by 1/8 so one freak minimum cannot pin it
+)
+
+var (
+	streamInflight int
+	// admBudgetBytes: how many bytes of in-flight streaming uploads one wasm VM may hold. This is the
+	// incremental part only -- the Go heap floor the watchdog keeps and whatever else the VM allocates sit
+	// on top of it -- and it is per VM, which means per Envoy worker: a gateway of three replicas with two
+	// workers each holds six times this, so the cluster-wide figure is the one to size against a pod limit.
+	admBudgetBytes = 32 << 20
+	admOverride    = 0.0 // >0 pins the limit to a request count and ignores the budget; adaptive writes here
+	admMin         = 50.0
+	admMax         = 4000.0
+	admAdaptive    = false // see above: adaptive costs Envoy heap and tail latency without buying throughput
+	admBaseline    int64   // shortest completion time observed, in nanoseconds
+	admDone        int
+)
+
+// admLimit is the number of in-flight streaming uploads this VM admits.
+func admLimit() float64 {
+	if admOverride > 0 {
+		return admOverride
+	}
+	n := float64(admBudgetBytes) / float64(effectiveCommitWindow())
+	if n < admMin {
+		n = admMin
+	}
+	if n > admMax {
+		n = admMax
+	}
+	return n
+}
+
+// admOnDone folds one request's completion time into the baseline, and into the limit when adaptive is on.
+func admOnDone(dur int64) {
+	if dur <= 0 {
+		return
+	}
+	if admBaseline == 0 || dur < admBaseline {
+		admBaseline = dur
+	}
+	admDone++
+	if admDone%admDecayEvery == 0 {
+		admBaseline += admBaseline / 8 // relax slowly so the baseline follows the real upstream
+	}
+	if !admAdaptive {
+		return
+	}
+	if admOverride == 0 {
+		admOverride = admLimit() // start adapting from the derived bound
+	}
+	switch {
+	case dur <= admBaseline*admLatencyOK:
+		if admOverride < admMax {
+			admOverride++
+		}
+	case dur > admBaseline*admLatencyBad:
+		admOverride *= 0.9
+		if admOverride < admMin {
+			admOverride = admMin
+		}
+	}
+}
+
+const (
+	ctxKeyAdmitted          = "aip_xform_admitted"
+	ctxKeyAdmitStart        = "aip_xform_admit_start"
+	ctxKeyDeclaredBodyBytes = "aip_declared_body_bytes"
+)
+
+// admDivertRatio: past the limit a request is only diverted to the buffered path while its body is no larger
+// than this many commit windows.
+//
+// Diverting is not free, and which way it costs depends on the body. The buffered path holds the whole body;
+// the streaming path holds one window. Measured on the gateway: at 70KB bodies against a 64KB window --
+// the two nearly equal -- diverting the excess at 5000 concurrency held 170MB less, because bytes move from
+// wasm linear memory, which never shrinks, into Envoy's buffer, which does. At 1MB bodies against a 256KB
+// window -- four times the window -- diverting 576 of 1857 requests instead cost 170MB more of Envoy heap
+// (363MB against 190MB) and a third of the throughput. So the excess is diverted only while the two are
+// comparable, and otherwise admitted: streaming a request the limit would have refused still holds less than
+// buffering it.
+const admDivertRatio = 2
+
+// admDivert reports whether a request past the limit should go to the buffered path.
+func admDivert(ctx wrapper.HttpContext) bool {
+	n, _ := ctx.GetContext(ctxKeyDeclaredBodyBytes).(int64)
+	if n <= 0 {
+		return true // size not declared: keep the original behaviour
+	}
+	return n <= int64(admDivertRatio*effectiveCommitWindow())
+}
+
+// onStreamDone releases the admission slot. It runs even when the client aborts mid-upload, which the body
+// hooks do not see; without it a few aborted requests would leak slots and pin the plugin to the buffered path.
+func onStreamDone(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) {
+	if admitted, _ := ctx.GetContext(ctxKeyAdmitted).(bool); admitted {
+		ctx.SetContext(ctxKeyAdmitted, false)
+		if streamInflight > 0 {
+			streamInflight--
+		}
+		if start, _ := ctx.GetContext(ctxKeyAdmitStart).(int64); start > 0 {
+			admOnDone(time.Now().UnixNano() - start)
+		}
+	}
+}
+
+// Runtime metrics of the streaming path. The fallback rate must be watched after rollout: a fallback means full buffering, sized for the worst case until the rate is near zero.
+// Metrics are observation only: when the host does not support them (the test emulator, or a deployment with metrics disabled) they switch off silently and never affect the request.
+var (
+	streamXformCounters   = map[string]proxywasm.MetricCounter{}
+	streamXformMetricsOff bool
+)
+
+func streamXformCount(name string) {
+	if streamXformMetricsOff {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			streamXformMetricsOff = true
+			log.Warnf("[stream-xform] metrics disabled: %v", r)
+		}
+	}()
+	key := "ai_proxy.stream_xform." + name
+	counter, ok := streamXformCounters[key]
+	if !ok {
+		counter = proxywasm.DefineCounterMetric(key)
+		streamXformCounters[key] = counter
+	}
+	counter.Increment(1)
+}
+
+type xformState struct {
+	st      *guard.State
+	plan    *provider.StreamPlan
+	apiName provider.ApiName
+	ctx     wrapper.HttpContext
+	cfg     config.PluginConfig
+}
+
+func newXformState(ctx wrapper.HttpContext, cfg config.PluginConfig) *xformState {
+	x := &xformState{ctx: ctx, cfg: cfg}
+	pc := cfg.GetProviderConfig()
+	fallbackOnly := func() *xformState {
+		x.st = guard.New(&guard.Plan{Fallback: x.fallback, Metric: streamXformCount, Log: log.Warnf})
+		x.st.ForceFallback()
+		return x
+	}
+	if pc == nil {
+		return fallbackOnly()
+	}
+	x.apiName, _ = ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
+	plan, why := pc.NewStreamPlan(ctx, x.apiName, cfg.GetProvider())
+	if plan == nil {
+		log.Debugf("[stream-xform] not streaming: %s", why)
+		streamXformCount("skipped")
+		return fallbackOnly()
+	}
+	if float64(streamInflight) >= admLimit() {
+		if admDivert(ctx) {
+			// Too many uploads in flight already, and buffering this one costs no more than streaming it.
+			streamXformCount("admission_fallback")
+			return fallbackOnly()
+		}
+		// Past the limit, but this body is large enough that buffering it would hold more than streaming it.
+		streamXformCount("admission_admitted_oversize")
+	}
+	streamInflight++
+	ctx.SetContext(ctxKeyAdmitted, true)
+	ctx.SetContext(ctxKeyAdmitStart, time.Now().UnixNano())
+	if streamCommitWindowBytes > 0 && plan.Tr != nil {
+		plan.Tr.SetCommitBytes(streamCommitWindowBytes) // before the first Write, which happens in Feed
+	}
+	x.plan = plan
+	var replan func(streamxform.Prelude) (streamxform.Xform, string)
+	if plan.Replan != nil {
+		replan = func(pre streamxform.Prelude) (streamxform.Xform, string) {
+			tr, why := plan.Replan(pre)
+			if tr != nil && streamCommitWindowBytes > 0 {
+				tr.SetCommitBytes(streamCommitWindowBytes)
+			}
+			return tr, why
+		}
+	}
+	gp := &guard.Plan{
+		Mode:        guard.Transform,
+		Passthrough: plan.Passthrough,
+		OnCommit:    x.onCommit,
+		OnFinish:    x.onFinish,
+		EarlyCommit: x.earlyCommit,
+		Replan:      replan,
+		Fallback:    x.fallback,
+		Uncoverable: func(why string) {
+			_ = util.ErrorHandler("ai-proxy.stream_xform_uncoverable", fmt.Errorf("streaming transform bailed after commit: %s", why))
+		},
+		Metric: streamXformCount,
+		Log:    log.Warnf,
+	}
+	if plan.Tr != nil {
+		gp.Tr = plan.Tr // a nil transformer must stay a nil interface, not a typed nil inside one
+	}
+	x.st = guard.New(gp)
+	return x
+}
+
+func (x *xformState) feed(chunk []byte, last bool) ([]byte, types.Action) {
+	return x.st.Feed(chunk, last)
+}
+
+// onCommit: before the headers are released for the first time. Fields the request path depends on (model / stream) that did not
+// appear before the commit point mean fallback, where "bounded lookahead, fall back past the window" lands; stream not seen by the end of the body is false, no fallback needed.
+func (x *xformState) onCommit(pre streamxform.Prelude, last bool) bool {
+	if x.plan.Passthrough {
+		// the buffered path does not touch the body: before the first chunk write back the original header info from the context (what its defer does)
+		if x.plan.AfterPrelude != nil {
+			x.plan.AfterPrelude(x.ctx, pre) // header work the buffered path does in the body phase without reading the body (Vertex raw auth)
+		}
+		saveContextsToHeaders(x.ctx)
+		return true
+	}
+	if (x.plan.RequireModelBeforeCommit && !pre.ModelSeen) || (x.plan.RequireStreamBeforeCommit && !pre.StreamSeen && !last) {
+		log.Warnf("[stream-xform] fields required by the request path not seen before the commit point, falling back to the buffered path")
+		return false
+	}
+	if x.plan.CommitGate != nil && !x.plan.CommitGate(pre, last) {
+		log.Warnf("[stream-xform] a fact the request path depends on is not settled before the commit point, falling back to the buffered path")
+		return false
+	}
+	x.cfg.GetProviderConfig().StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, true)
+	if x.plan.AfterPrelude != nil {
+		x.plan.AfterPrelude(x.ctx, pre)
+	}
+	saveContextsToHeaders(x.ctx)
+	return true
+}
+
+// earlyCommit reports whether the headers no longer depend on anything still to come: model has been seen
+// (every plan applies it), and stream too where the plan says a header or path needs it. Passthrough plans
+// have nothing to wait for. Only consulted when streamEarlyCommit is on.
+func (x *xformState) earlyCommit(pre streamxform.Prelude) bool {
+	if !streamEarlyCommit {
+		return false
+	}
+	if x.plan.Passthrough {
+		return true
+	}
+	if x.plan.ApplyModel && !pre.ModelSeen {
+		return false
+	}
+	if x.plan.RequireStreamBeforeCommit && !pre.StreamSeen {
+		return false
+	}
+	return true
+}
+
+func (x *xformState) onFinish(pre streamxform.Prelude) {
+	if x.plan.Passthrough {
+		return
+	}
+	pc := x.cfg.GetProviderConfig()
+	pc.StreamApplyPrelude(x.ctx, x.apiName, x.plan, pre, false)
+	pc.StreamFinalizeContext(x.ctx, x.apiName, x.plan, pre)
+	if x.plan.OnFinish != nil {
+		x.plan.OnFinish(x.ctx)
+	}
+}
+
+// fallback is the buffered path.
+func (x *xformState) fallback(body []byte) types.Action {
+	return onHttpRequestBody(x.ctx, x.cfg, body)
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, body []byte) types.Action {

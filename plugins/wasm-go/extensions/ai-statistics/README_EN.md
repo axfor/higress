@@ -8,6 +8,17 @@ description: AI Statistics plugin configuration reference
 
 Provides basic AI observability capabilities, including metric, log, and trace. The ai-proxy plug-in needs to be connected afterwards. If the ai-proxy plug-in is not connected, the user needs to configure it accordingly to take effect.
 
+## Streaming request body observation
+
+In lightweight mode (`use_default_response_attributes: true`, or a custom attribute set with no `request_body`
+source) the plugin only needs the top-level `model` and the number of user turns from the request body. Both
+are computed while the body streams through untouched: nothing is buffered. Configurations that extract
+attributes from the request body (the default attribute set with `messages` / `question` / `system`, or custom
+`request_body` attributes) keep the buffered path.
+
+Metrics: `ai_statistics.stream.streamed` / `observe_bailed` (observation stops on a malformed body, the body is
+still forwarded).
+
 ## Runtime Properties
 
 Plugin Phase: `CUSTOM`

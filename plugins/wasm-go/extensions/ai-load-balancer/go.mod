@@ -5,7 +5,7 @@ go 1.24.1
 toolchain go1.24.3
 
 require (
-	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250822030947-8345453fddd0
+	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2
 	github.com/higress-group/wasm-go v1.0.2-0.20250821081215-b573359becf8
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/client_model v0.6.2
@@ -23,3 +23,5 @@ require (
 )
 
 require github.com/tidwall/sjson v1.2.5 // indirect
+
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432

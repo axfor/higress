@@ -5,6 +5,7 @@ go 1.24.1
 toolchain go1.24.4
 
 require (
+	github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform v0.0.0
 	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2
 	github.com/higress-group/wasm-go v1.0.10-0.20260120033417-1c84f010156d
 	github.com/stretchr/testify v1.9.0
@@ -12,6 +13,7 @@ require (
 )
 
 require (
+	github.com/axfor/ason v0.0.0-20260908150305-eae428eada79 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
@@ -22,3 +24,7 @@ require (
 	github.com/tidwall/sjson v1.2.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/alibaba/higress/plugins/wasm-go/pkg/streamxform => ../../pkg/streamxform
+
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260907232329-d199a683943d

@@ -28,6 +28,59 @@ description: AI 代理插件配置参考
 
 > 请求路径后缀匹配 `/v1/images/generations` 时，对应文生图场景，会用 OpenAI 的图片生成协议解析请求 Body，再转换为对应 LLM 厂商的图片生成协议
 
+**请求体流式转换（Streaming Request Transform）**
+
+插件对请求体默认采用流式处理：请求体按块到达、按块转换、按块发往供应商，不再整体缓冲后再做协议转换。
+网关内存占用与请求体大小无关（20MB × 80 并发实测内存增量约 0），首字节延迟也随之下降。
+无需任何配置。目前走流式的路径：
+
+- 目标为 Claude 的文生文请求（OpenAI → Claude 协议转换，含多模态、tools、tool_calls、thinking 等全部字段）；
+- OpenAI 兼容透传：`openai`、`vllm`、`doubao`、`longcat` 以及 `ai360`/`baichuan`/`baidu`/`cloudflare`/`deepseek`/`fireworks`/`galadriel`/`github`/`grok`/`groq`/`mistral`/`moonshot`/`ollama`/`spark`/`stepfun`/`together-ai`/`yi`；
+- `qwen`（兼容模式与 DashScope 原生模式）、`zhipuai`、`openrouter`、`minimax`（v2 接口）（各自的字段推导按官方逻辑逐条复刻）；
+- `azure`（请求路径依赖 body 里的 model 时，model 须出现在请求体前 64KB 内，否则回落）；
+- 目标为 Gemini 的文生文请求（OpenAI → Gemini 协议转换；请求路径依赖 model 与 stream，二者须出现在前 64KB 内；含 http(s) 图片链接的请求需要抓取图片，仍走全量路径）；
+- `generic`（请求体逐块直接放行）；Claude 原生接口（`/v1/messages`、`/v1/complete`、embeddings）以及上述透传供应商的其他 JSON 接口（images / audio / responses / videos / fine-tuning 等）。multipart 请求仍走全量路径；
+- Claude 协议入站的自动转换（`/v1/messages` 打到不原生支持 Anthropic 协议的 OpenAI 兼容供应商）：引擎里两个转换器串联，先 Claude → OpenAI（每条消息整条有界持有后按官方规则转换，system 在 messages 之后时整个 messages 有界持有），再走该供应商自己的转换——就是该供应商的 chat 计划前面套一段转换（zhipuai、openrouter、azure、minimax、gemini、vertex 等都可以，`mergeConsecutiveMessages` 打开时合并段放在两者之间）；zhipuai / openrouter 要读全量路径从 Claude body 里取的 thinking 类型与预算，转换段把它们交给变体在尾部用；
+- Gemini 原生 `generateContent` / `streamGenerateContent`（全量路径本就不改 body，逐块放行）；
+- embeddings：`gemini`（`input` 数组逐元素变 `requests`，元素要带模型名，`input` 在 `model` 之前时整个 `input` 有界持有）、`vertex`、`qwen` 原生（非字符串元素与全量路径同样拒绝）；`gemini` 的 `/v1/images/generations`；`vertex` 的 `/v1/images/generations` / `edits` / `variations`（JSON 请求体；图片输入的 data URL 边到边出成 `inlineData`，http(s) 链接须在 8KB 内，prompt 最后写出；`images` 与 `image` 同时给且 `image` 在前时 parts 顺序按到达顺序，一个输入同时给非空的 `url` 与 `image_url` 时拒绝而不是取后者；multipart 请求体仍走全量路径）；
+- `protocol: original` 的所有供应商（全量路径在 original 下不碰 body），例外是对 body 签名的 hunyuan 与 AK/SK 模式的 bedrock，以及在 original 下同样重建 body 的 Pro 接口模式 minimax；
+- bedrock Converse 的 chat（apiTokens 模式；OpenAI → Converse 整份映射：system 块、toolUse / toolResult 块与合并、data URL 图片、inferenceConfig / thinking / toolConfig；配置了 prompt cache 且模型支持时回落，缓存点要落在最后一条 user 消息上）；
+- bedrock Mantle `/v1/messages`（apiTokens 模式，只做模型映射与 Accept 头；AK/SK 模式要对 body 做 SigV4 签名，仍走全量）；
+- vertex 原生 REST 直通（Express 模式 API key 进 query；标准模式在 OAuth token 已缓存时流式，冷启动后第一个请求由全量路径取 token）；
+- vertex 的 `/v1/messages` 直通（Anthropic body 原样送 `:rawPredict` / `:streamRawPredict`，只删 `model`、补 `anthropic_version` 与默认 `max_tokens`、去掉 `context_management`；路径依赖 model 与 stream，二者须出现在窗口内）；
+- vertex OpenAI 兼容模式（`vertexOpenAICompatible`）的 chat（只做模型映射与固定路径；token 缓存要求同上）；
+- `cohere` 的 chat（OpenAI → Cohere v1 chat：只取第一条消息的文本与几个标量，其余字段与消息全部丢弃，与全量路径相同）；
+- `deepl`（OpenAI → DeepL 翻译：非 system 消息的文本进 `text` 数组、system 消息进 `context`，host 由 `model` 是 Free / Pro 决定）；
+- `minimax` Pro 接口模式的 chat（system → `bot_setting`、user / assistant → 带 sender 的消息、其余角色丢弃，GroupId 进路径）；
+- `dify` 的 chat（各消息文本按角色标题拼成一个字符串，边收边写进 `query` 或 `inputs`；`conversation_id` 取自请求头）；
+- `triton` 的 chat（只留最后一条消息的 id 与文本，路径与 host 由模型、stream 决定）；
+- `kling` 的 `/v1/videos`（body 原样，`model` 映射进 `model_name`；路径由是否带图片输入字段决定，body 超过窗口且尚未见到图片字段时回落）；
+- vertex 的 chat（OpenAI → Anthropic 格式或 Vertex 自己的 Gemini 格式，按映射后的模型选择）：先用探针找到 `model`，再按映射结果选转换器并从第一个字节重放（引擎的"重新规划"），`model` 与 `stream` 须出现在窗口内。Gemini 格式下 assistant 消息的内容要等 `tool_calls` 到齐（超过 1MB 回落），含 http(s) 图片链接的 URL 须在 8KB 内。
+- `customSettings`：作为管道的第一段跑在供应商转换之前（全量路径也是先改 body 再交 handler）；覆盖型设置在所在容器一开始就写出（请求里原有的值丢弃），填充型设置等容器结束、确认缺失后写出，中间缺的对象按 sjson 的方式补出来；路径只支持点分的普通键（数组下标、转义、通配等 gjson 语法回落），路径中途遇到数组回落（sjson 在那里报错）。
+- `responseJsonSchema`（openai / longcat）：配置的 schema 替换请求里的 `response_format`；全量路径顺带把整个请求经结构体重新序列化一遍（不认识的字段、零值的可选字段被丢掉，`stream_options.include_usage: false` 变成 true，数字按 `json.Marshal` 的写法重排），流式用一段"结构体回环"复刻这一步：按请求结构体派生的类型树逐层丢掉没有字段的键、省略 omitempty 的零值、补上非 omitempty 字段的零值、重渲染数字，接口类型的子树只重渲染数字、其余原样。
+- `context`：文件内容已缓存（第一个请求走全量路径取文件）后，chat 请求流式插入：OpenAI 形态的 body（openai 兼容族、azure、qwen 兼容、zhipuai、openrouter、minimax v2、vertex OpenAI 兼容端点、Claude 协议入站转换后）在第一条非 system 消息之前插入 system 消息，为此每条消息在 role 到来之前的键有界暂存（64KB）；claude 把内容接在 system 前面（`内容\n原 system`）。插入之后同样有一段结构体回环（全量路径的插入函数经 `chatCompletionRequest` 重序列化）。偏差：全部消息都是 system 时全量路径把它放在最前，流式已放行这些消息、只能追加在最后；请求没有 system 消息时全量路径的 claude 插入会空指针崩溃，流式把内容作为 system。其它 body 形态（gemini、vertex Gemini 格式、bedrock 等）的 chat 仍走全量路径。
+- `mergeConsecutiveMessages`（含 `hiclawMode`）：管道里的一段，跑在供应商转换之前、Claude 协议入站转换之后（与全量路径同序）；每条消息整条有界持有（1MB）到下一条的 role 明确才决定合不合，合并规则与全量路径相同（含"数组合并后再合并只留最新一条 parts"的行为）；没合并过的消息原样放行；全量路径合并后对整个请求的结构体重序列化不复刻。`image_url.url` 等全量路径直接断言的字段缺失时回落（全量路径会 panic）。
+- qwen 原生协议的 `qwenFileIds`（模型映射后为 qwen-long 时）与 `context`：在第一条非 system 消息前插入文件列表 / 文件内容的 system 消息，第一条就是非 system 时先补一条 "You are a helpful assistant."；`qwenFileIds` 把前导 system 消息折成一条（文本按换行拼接）。每条消息在 role 到来前有界暂存（64KB）；`qwenFileIds` 要求 `model` 在 `messages` 之前（插不插取决于模型）。偏差：全部消息都是 system 时全量路径把补的两条放最前，流式追加在后（折叠模式下折起来的 system 消息跟在后面写回）。
+- multipart 请求体（`/v1/images/edits`、`/v1/images/variations`，走默认转换的供应商）：全量路径只改 `model` 字段——映射没变时 body 原样，变了就用 Go 的 multipart writer 整体重编码；流式在读到 `model` 字段前把两种渲染并排持有（不超过提交窗口），读到后放出全量路径会产出的那一种，之后的图片部分直接流过。`model` 须在窗口内（SDK 把文本字段放在文件前面）；第二个 `model` 字段、头部超 8KB、`model` 值超 4KB、裸 LF 换行的 body 回落；配置了 `customSettings` 的 multipart 请求回落（全量路径对 multipart 做 sjson 的结果不复刻）。Vertex / Gemini 把表单解成自己的 JSON 请求，仍走全量路径。
+
+其余供应商（AK/SK 模式的 Bedrock、Hunyuan）以及配置了
+`contextCleanupCommands` / `retryOnFailure`的场景，仍走原有的全量缓冲路径，行为不变。
+`firstByteTimeout` 在 chat 上照常生效（`stream` 须出现在窗口内，否则回落），`providerBasePath` 对所有供应商照常生效。
+
+运行指标：`ai_proxy.stream_xform.streamed` / `fallback` / `uncoverable` / `skipped` 四个计数器（Envoy 统计里带 `wasmcustom.` 前缀）（走流式 / 回落到全量 /
+提交点后失败 / 配置或供应商不适用）。回落率应接近零，否则内存容量仍要按全量缓冲配置。
+
+流式路径在读到前 64KB 之前不向上游发送任何字节；这段窗口内遇到无法流式处理的形态（极少数，如重复的 JSON key、
+非法的图片 data URL）会自动回落到全量路径。越过窗口后才遇到这类形态的请求会以 500 结束，
+错误详情为 `ai-proxy.stream_xform_uncoverable`。
+
+运维注意：流式路径在读到 64KB 时就建立上游连接并开始发送，慢速上传的客户端会让上游连接比全量缓冲时占用更久；
+上游的请求超时与空闲超时要按"上传时间 + 生成时间"配置。
+
+类型校验与全量路径一致：流式路径按请求结构体推导出的类型树校验根级与嵌套字段，拒绝的请求集合与全量路径的
+结构体解码相同（`streamTypeCheck: false` 可关闭）。与全量路径的已知差异只有一条：`stream` 字段出现在请求体 64KB 之后时，
+`Accept: text/event-stream` 请求头不再改写（上游供应商均以请求体中的 `stream` 决定是否流式）。
+
 ## 运行属性
 
 插件执行阶段：`默认阶段`
@@ -40,6 +93,16 @@ description: AI 代理插件配置参考
 | 名称       | 数据类型 | 填写要求 | 默认值 | 描述                         |
 | ---------- | -------- | -------- | ------ | ---------------------------- |
 | `provider` | object   | 必填     | -      | 配置目标 AI 服务提供商的信息 |
+
+流式转换的调优字段（顶层，与 `provider` 平级，一般无需配置）：
+
+| 名称                        | 数据类型 | 填写要求 | 默认值   | 描述 |
+| --------------------------- | -------- | -------- | -------- | ---- |
+| `streamCommitWindowBytes`   | number   | 非必填   | 65536    | 提交窗口。读满这么多字节之前不向上游发送任何字节，≤ 窗口的请求体行为与全量路径逐字节相同；窗口越大兼容边界越宽，每个在途请求持有的字节也越多。取值范围 4096–1048576 |
+| `streamTypeCheck`           | bool     | 非必填   | true     | 按请求结构体推导的类型树校验请求体，拒绝面与全量路径一致。关闭后只校验转换读取的字段 |
+| `streamInflightBudgetBytes` | number   | 非必填   | 33554432 | 每个 wasm VM 在途流式请求的字节预算，准入上限 = 预算 / 窗口（默认 512）。超限后请求体 ≤ 2 × 窗口的请求转全量路径，更大的仍走流式（缓冲它反而持有更多）。取值范围 1MB–1GB |
+| `streamGcFloorBytes`        | number   | 非必填   | 67108864 | wasm-go GC 看门狗的堆阈值：堆超过它而运行时自身 GC 未触发时强制回收一次。取值范围 8MB–512MB |
+| `streamEarlyCommit`         | bool     | 非必填   | false    | 请求头不再依赖尚未到达的字段（`model`，路径或头依赖 `stream` 的协议再加 `stream`）即提交，窗口只做上限。每个在途请求持有的字节更少，但放弃"≤ 窗口与全量路径逐字节相同"的保证：提交后才遇到无法流式的形态返回 500 而非回落，`stream` 落在 `model` 所在块之后时 `Accept` 不再改写 |
 
 `provider`的配置字段说明如下：
 

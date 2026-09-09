@@ -32,6 +32,7 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessStreamingRequestBodyWithAction(onHttpStreamingRequestBody),
 		wrapper.WithRebuildMaxMemBytes[ModelRouterConfig](200*1024*1024),
 	)
 }
@@ -48,6 +49,7 @@ type ModelRouterConfig struct {
 	modelToHeader         string
 	enableOnPathSuffix    []string
 	keepOriginalModelName bool
+	streamEarlyCommit     bool
 	// Auto routing configuration
 	enableAutoRouting bool
 	autoRoutingRules  []AutoRoutingRule
@@ -62,6 +64,7 @@ func parseConfig(json gjson.Result, config *ModelRouterConfig) error {
 	config.addProviderHeader = json.Get("addProviderHeader").String()
 	config.modelToHeader = json.Get("modelToHeader").String()
 	config.keepOriginalModelName = json.Get("keepOriginalModelName").Bool()
+	config.streamEarlyCommit = json.Get("streamEarlyCommit").Bool()
 
 	enableOnPathSuffix := json.Get("enableOnPathSuffix")
 	if enableOnPathSuffix.Exists() && enableOnPathSuffix.IsArray() {
@@ -145,6 +148,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelRouterConfig) typ
 	proxywasm.RemoveHttpRequestHeader("content-length")
 	// 100MB buffer limit
 	ctx.SetRequestBodyBufferLimit(DefaultMaxBodyBytes)
+
+	// JSON with a plain top-level modelKey: streaming path (see stream.go); everything else takes the buffered path
+	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
+	if !streamable(config, contentType) {
+		ctx.BufferRequestBody()
+	}
 
 	return types.HeaderStopIteration
 }

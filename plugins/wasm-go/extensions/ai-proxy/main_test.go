@@ -510,9 +510,9 @@ func Test_normalizeOpenAiRequestBody_disableStreamUsageStats(t *testing.T) {
 
 func TestProviderConfig_disableStreamUsageStats_fromJson(t *testing.T) {
 	tests := []struct {
-		name   string
-		json   string
-		want   bool
+		name string
+		json string
+		want bool
 	}{
 		{
 			name: "omitted defaults to false",

@@ -5,7 +5,7 @@ go 1.24.1
 toolchain go1.24.4
 
 require (
-	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250822030947-8345453fddd0
+	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2
 	github.com/stretchr/testify v1.9.0
 	github.com/tidwall/gjson v1.18.0
 )
@@ -25,3 +25,5 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 )
+
+replace github.com/higress-group/wasm-go => github.com/axfor/wasm-go v1.1.3-0.20260906150907-5858ed563432
